@@ -7,7 +7,7 @@
 
 **A single-request inference engine for block-diffusion language models**
 
-Paper (coming soon) · [Project page](https://introspective-diffusion.github.io/orl-dlm) · [ORL code](https://github.com/Introspective-Diffusion/ORL) ·
+[Paper](ORL_paper.pdf) · [Project page](https://introspective-diffusion.github.io/orl-dlm) · [ORL code](https://github.com/Introspective-Diffusion/ORL) ·
 [Checkpoints](https://huggingface.co/collections/yifanyu/orl-on-policy-residual-learning-for-diffusion-lms)
 
 [Models](docs/models.md) · [Performance](docs/performance.md) · [Benchmarks](docs/benchmarks.md) ·
@@ -21,7 +21,7 @@ dlmrt runs one request at a time and makes that request fast. Every forward deno
 denoising loop runs on the GPU. It serves QwenDLM, LLaDA2.1-mini and DiffusionGemma checkpoints on one GPU or tensor
 parallel across an NVLink node, on NVIDIA Hopper (H100) and, for LLaDA2.1-mini and DiffusionGemma, Blackwell (B200,
 B300; NVFP4 also on the RTX 5090). It is the inference engine of
-On-Policy Residual Learning for Diffusion Language Models (ORL).
+[On-Policy Residual Learning for Diffusion Language Models](ORL_paper.pdf) (ORL).
 
 ## Highlights
 
