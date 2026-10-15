@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dlmrt"
+dynamic = ["version"]
+description = "A single-request inference engine for block-diffusion language models"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.10"
+authors = [{ name = "The dlmrt authors" }]
+keywords = ["diffusion language models", "inference", "cuda", "triton", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.11",
+    "triton>=3.6",
+    "safetensors",
+    "transformers>=5.8",
+    "huggingface_hub",
+    "sgl-deep-gemm",
+    "sglang-kernel",
+]
+
+[project.optional-dependencies]
+blackwell = ["flashinfer-python>=0.6.12"]
+sglang-numerics = ["flashinfer-python==0.6.12"]
+bench = ["pyarrow"]
+dev = ["pytest", "pyarrow", "ruff", "pre-commit"]
+
+[project.scripts]
+dlmrt = "dlmrt.entrypoints.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "dlmrt.version.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["dlmrt*"]
+
+[tool.setuptools.package-data]
+"dlmrt.ops" = ["csrc/**/*"]
+
+[tool.ruff]
+line-length = 128
+target-version = "py310"
+extend-exclude = ["dlmrt/ops/csrc"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "SIM"]
+ignore = [
+    "E731",   # lambda assignments read better in a few kernel launchers
+    "E741",   # Triton kernels name their output pointer O, as in the papers they follow
+    "B023",   # graph-capture lambdas bind their loop variable on purpose (captured immediately)
+    "B905",   # zip(strict=...) adds nothing where the lengths match by construction
+    "SIM105", # try / except / pass is as clear as contextlib.suppress
+    "SIM108", # ternaries are not always clearer
+    "SIM115", # tests hold reference files open for their whole module
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]
+"examples/*" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,123 @@
+#pragma once
+
+#include "util.cuh"
+#include <pybind11/pybind11.h>
+
+#ifdef TORCH_COMPILE
+// need these if we want to use device guard, but currently broken
+#include "torch_helpers.cuh"
+#include <c10/cuda/CUDAGuard.h>
+#endif
+
+namespace kittens {
+namespace py {
+
+// Helper function to get device from first argument
+template<typename First, typename... Rest>
+static int get_first_device(First first, Rest... rest) {
+    return pybind11::cast<int>(first.attr("get_device")());
+}
+#ifdef TORCH_COMPILE
+// for the cudaguard version
+template<typename First, typename... Rest>
+static char get_first_device_char(First first, Rest... rest) {
+    return (char)pybind11::cast<int>(first.attr("get_device")());
+}
+#endif
+
+template<typename T> struct from_object {
+    static T make(pybind11::object obj) {
+        return obj.cast<T>();
+    }
+};
+
+template<ducks::gl::all GL> struct from_object<kittens::optional<GL>> {
+    static kittens::optional<GL> make(pybind11::object obj) {
+        if (obj.is_none()) {
+            return kittens::optional<GL>(std::nullopt);
+        }
+        return kittens::optional<GL>(from_object<GL>::make(obj));
+    }
+};
+
+template<ducks::gl::all GL> struct from_object<GL> {
+    static GL make(pybind11::object obj) {
+        // Check if argument is a torch.Tensor
+        if (pybind11::hasattr(obj, "__class__") && 
+            obj.attr("__class__").attr("__name__").cast<std::string>() == "Tensor") {
+        
+            // Check if tensor is contiguous
+            if (!obj.attr("is_contiguous")().cast<bool>()) {
+                throw std::runtime_error("Tensor must be contiguous");
+            }
+            if (obj.attr("device").attr("type").cast<std::string>() == "cpu") {
+                throw std::runtime_error("Tensor must be on CUDA device");
+            }
+            
+            // Get shape, pad with 1s if needed
+            std::array<int, 4> shape = {1, 1, 1, 1};
+            auto py_shape = obj.attr("shape").cast<pybind11::tuple>();
+            size_t dims = py_shape.size();
+            if (dims > 4) {
+                throw std::runtime_error("Expected Tensor.ndim <= 4");
+            }
+            for (size_t i = 0; i < dims; ++i) {
+                shape[4 - dims + i] = pybind11::cast<int>(py_shape[i]);
+            }
+            
+            // Get data pointer using data_ptr()
+            uint64_t data_ptr = obj.attr("data_ptr")().cast<uint64_t>();
+            
+            // Create GL object using make_gl
+            return make_gl<GL>(data_ptr, shape[0], shape[1], shape[2], shape[3]);
+        }
+        throw std::runtime_error("Expected a torch.Tensor");
+    }
+};
+
+template<typename T> concept has_dynamic_shared_memory = requires(T t) { { t.dynamic_shared_memory() } -> std::convertible_to<int>; };
+
+template<typename> struct trait;
+template<typename MT, typename T> struct trait<MT T::*> { using member_type = MT; using type = T; };
+template<typename> using object = pybind11::object;
+template<auto kernel, typename TGlobal> static void bind_kernel(auto m, auto name, auto TGlobal::*... member_ptrs) {
+    m.def(name, [](object<decltype(member_ptrs)>... args, pybind11::kwargs kwargs) {
+        TGlobal __g__ {from_object<typename trait<decltype(member_ptrs)>::member_type>::make(args)...};
+        // set device guard based on the first argument of args
+#ifdef TORCH_COMPILE
+        char device_idx = get_first_device_char(args...);
+        at::cuda::CUDAGuard device_guard{device_idx};
+#else
+        int device_idx = get_first_device(args...);
+        cudaSetDevice(device_idx);
+#endif
+        cudaStream_t raw_stream = nullptr;
+        if (kwargs.contains("stream")) {
+            // Extract stream pointer
+            uintptr_t stream_ptr = kwargs["stream"].attr("cuda_stream").cast<uintptr_t>();
+            raw_stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+        } else {
+#ifdef TORCH_COMPILE
+            raw_stream = at::cuda::getCurrentCUDAStream().stream();
+#else
+            raw_stream = nullptr;
+#endif
+        }
+        if constexpr (has_dynamic_shared_memory<TGlobal>) {
+            int __dynamic_shared_memory__ = (int)__g__.dynamic_shared_memory();
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, __dynamic_shared_memory__);
+            kernel<<<__g__.grid(), __g__.block(), __dynamic_shared_memory__, raw_stream>>>(__g__);
+        } else {
+            kernel<<<__g__.grid(), __g__.block(), 0, raw_stream>>>(__g__);
+        }
+    });
+}
+template<auto function, typename TGlobal> static void bind_function(auto m, auto name, auto TGlobal::*... member_ptrs) {
+    m.def(name, [](object<decltype(member_ptrs)>... args) {
+        TGlobal __g__ {from_object<typename trait<decltype(member_ptrs)>::member_type>::make(args)...};
+        function(__g__);
+    });
+}
+
+} // namespace py
+} // namespace kittens
