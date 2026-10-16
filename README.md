@@ -7,7 +7,7 @@
 
 **A single-request inference engine for block-diffusion language models**
 
-[Paper](ORL_paper.pdf) · [Project page](https://introspective-diffusion.github.io/orl-dlm) · [ORL code](https://github.com/Introspective-Diffusion/ORL) ·
+[Paper](https://arxiv.org/abs/2610.20687) · [Project page](https://introspective-diffusion.github.io/orl-dlm) · [ORL code](https://github.com/Introspective-Diffusion/ORL) ·
 [Checkpoints](https://huggingface.co/collections/yifanyu/orl-on-policy-residual-learning-for-diffusion-lms)
 
 [Models](docs/models.md) · [Performance](docs/performance.md) · [Benchmarks](docs/benchmarks.md) ·
@@ -15,13 +15,11 @@
 
 </div>
 
-<!-- To update once the paper is on arXiv: the Paper link above, the paper title below and the BibTeX url. -->
-
 dlmrt runs one request at a time and makes that request fast. Every forward denoises a whole block of tokens, and the
 denoising loop runs on the GPU. It serves QwenDLM, LLaDA2.1-mini and DiffusionGemma checkpoints on one GPU or tensor
 parallel across an NVLink node, on NVIDIA Hopper (H100) and, for LLaDA2.1-mini and DiffusionGemma, Blackwell (B200,
 B300; NVFP4 also on the RTX 5090). It is the inference engine of
-[On-Policy Residual Learning for Diffusion Language Models](ORL_paper.pdf) (ORL).
+[On-Policy Residual Learning for Diffusion Language Models](https://arxiv.org/abs/2610.20687) (ORL).
 
 ## Highlights
 
@@ -169,10 +167,14 @@ tools/             check_imports.py (the static import check CI runs), architect
 
 ```bibtex
 @misc{yu2026orl,
-  title  = {On-Policy Residual Learning for Diffusion Language Models},
-  author = {Yu, Yifan and Jian, Yuqing and Li, Jisen and Hu, Yuezhou and Zhang, Tianyi and Wu, Xiaoxia and
-            Zhu, Rui-Jie and Wang, Junxiong and Zhou, Zhongzhu and Lai, Fan and Zou, James and Xu, Chenfeng},
-  year   = {2026}
+  title         = {On-Policy Residual Learning for Diffusion Language Models},
+  author        = {Yu, Yifan and Jian, Yuqing and Li, Jisen and Hu, Yuezhou and Zhang, Tianyi and Wu, Xiaoxia and
+                   Zhu, Rui-Jie and Wang, Junxiong and Zhou, Zhongzhu and Lai, Fan and Zou, James and Xu, Chenfeng},
+  year          = {2026},
+  eprint        = {2610.20687},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2610.20687}
 }
 ```
 
