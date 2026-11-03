@@ -755,11 +755,13 @@ def decide(stats, argmax, sample, tokens, out, accepted, step, remaining, seed, 
 def _advance(MODE, P, TOKENS, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK, SLOTS, OFFSETS, BLOCKS,
              WANT, PROMPT, PLEN, MAX_NEW, TOKEN_OUT, STEP_OUT, BLOCK_OUT, CLOCK_OUT, CANVASES, EOS, CTRL, COUNTS, LANE,
              WANTS, window, prompt_stride, out_stride, steps_stride, limit, VOCAB: tl.constexpr, NEOS: tl.constexpr,
-             B: tl.constexpr, B1: tl.constexpr = 0, B2: tl.constexpr = 0, B3: tl.constexpr = 0,
+             B0: tl.constexpr, B: tl.constexpr, B1: tl.constexpr = 0, B2: tl.constexpr = 0, B3: tl.constexpr = 0,
              FUSED: tl.constexpr = False):
     """After a batched forward, one program per request: its state at slot SLOTS[program], its BLOCKS[slot] rows from
-    OFFSETS[slot] (canvas lengths B, B1, B2, B3; 0: unused), see _advance_one. FUSED: WANTS[program] = 1 if its canvas
-    stopped and waits for a commit lane (see _claim), else 0."""
+    OFFSETS[slot] (canvas lengths B, B1, B2, B3; 0: unused), see _advance_one. Rows of another count (a multiple of
+    the shortest length B0) are a prompt chunk: the next chunk, or, after the prompt, the request parks (SWITCH,
+    CTRL[2] += 1) until the host gives it canvas rows. FUSED: WANTS[program] = 1 if its canvas stopped and waits for
+    a commit lane (see _claim), else 0."""
     _wait()
     p = tl.program_id(0)
     slot = tl.load(SLOTS + p)
@@ -767,6 +769,19 @@ def _advance(MODE, P, TOKENS, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REMAININ
     o = tl.load(OFFSETS + slot)
     if FUSED:
         tl.store(WANTS + p, 0)
+    if (rows != B) & (rows != B1) & (rows != B2) & (rows != B3):
+        if tl.load(MODE + slot) == PREFILL:
+            pos = tl.load(START + slot) + rows
+            plen = tl.load(PLEN + slot)
+            if pos >= plen:
+                tl.store(P + slot * 3, plen)
+                tl.store(P + slot * 3 + 1, 0)
+                tl.store(MODE + slot, SWITCH)
+                tl.atomic_add(CTRL + 2, 1)
+            else:
+                _prompt_chunk(TOKENS + o, PROMPT, slot, pos, rows, plen, prompt_stride, B0)
+                tl.store(START + slot, pos)
+                tl.store(END + slot, pos + rows)
     if rows == B:
         _advance_one(MODE, P, TOKENS, o, OUT + o, ACCEPTED + o, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK, WANT,
                      PROMPT, PLEN, MAX_NEW, TOKEN_OUT, STEP_OUT, BLOCK_OUT, CLOCK_OUT, CANVASES, EOS, CTRL, COUNTS,
@@ -863,6 +878,15 @@ def _advance_one(MODE, P, ROWS, o, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REM
 
 
 @triton.jit
+def _prompt_chunk(TOKENS, PROMPT, slot, pos, rows, plen, prompt_stride, B0: tl.constexpr):
+    """The prompt's tokens [pos, pos + rows) into TOKENS (0 past the prompt), B0 at a time."""
+    for c in range(0, rows, B0):
+        i = c + tl.arange(0, B0)
+        src = pos + i
+        tl.store(TOKENS + i, tl.load(PROMPT + slot.to(tl.int64) * prompt_stride + src, src < plen, 0))
+
+
+@triton.jit
 def _next_canvas(MODE, P, TOKENS, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK, WANT, CTRL, slot,
                  offset, ordinal, window, VOCAB: tl.constexpr, B: tl.constexpr):
     """Begin canvas `ordinal` at `offset` (P already holds both) if the request wants B rows; else park the request
@@ -889,8 +913,8 @@ def advance(mode, params, tokens, out, accepted, start, end, leftpad, step, rema
     _advance[(slots.numel(),)](mode, params, tokens, out, accepted, start, end, leftpad, step, remaining, seed, block,
                                slots, offsets, blocks, want, prompt, prompt_len, max_new, token_out, step_out,
                                block_out, clock_out, canvases, eos, ctrl, counts, lane, wants, window, prompt.shape[1],
-                               token_out.shape[1], step_out.shape[1], limit, vocab, eos.numel(), *b, lanes is not None,
-                               **LAUNCH)
+                               token_out.shape[1], step_out.shape[1], limit, vocab, eos.numel(), min(classes), *b,
+                               lanes is not None, **LAUNCH)
 
 
 @triton.jit
@@ -1009,14 +1033,22 @@ def release_lanes(lane, row_slot, row_index, idle, b0, rows):
 
 @triton.jit
 def _admit(MODE, P, TOKENS, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK, SLOTS, OFFSETS, BLOCKS,
-           PROMPT, PLEN, window, prompt_stride, VOCAB: tl.constexpr, B: tl.constexpr, B1: tl.constexpr = 0,
-           B2: tl.constexpr = 0, B3: tl.constexpr = 0):
+           PROMPT, PLEN, window, prompt_stride, VOCAB: tl.constexpr, B0: tl.constexpr, B: tl.constexpr,
+           B1: tl.constexpr = 0, B2: tl.constexpr = 0, B3: tl.constexpr = 0):
     """At a launch's start, per request (state at slot SLOTS[program], BLOCKS[slot] rows from OFFSETS[slot]): one
-    admitted by the host (ADMIT) starts its prefill, one parked for new rows (SWITCH) begins its next canvas."""
+    admitted by the host (ADMIT) starts its prefill, one parked for new rows (SWITCH) begins its next canvas. Rows of
+    another count than the canvas lengths (a multiple of B0) are a prompt chunk of that many tokens."""
     _wait()
     slot = tl.load(SLOTS + tl.program_id(0))
     rows = tl.load(BLOCKS + slot)
     o = tl.load(OFFSETS + slot)
+    if (rows != B) & (rows != B1) & (rows != B2) & (rows != B3):
+        if tl.load(MODE + slot) == ADMIT:
+            _prompt_chunk(TOKENS + o, PROMPT, slot, 0, rows, tl.load(PLEN + slot), prompt_stride, B0)
+            tl.store(START + slot, 0)
+            tl.store(END + slot, rows)
+            tl.store(REMAINING + slot, 0)
+            tl.store(MODE + slot, PREFILL)
     if rows == B:
         _admit_one(MODE, P, TOKENS + o, OUT + o, ACCEPTED + o, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK, PROMPT,
                    PLEN, slot, window, prompt_stride, VOCAB, B)
@@ -1059,7 +1091,8 @@ def admit(mode, params, tokens, out, accepted, start, end, leftpad, step, remain
           blocks, prompt, prompt_len, window, vocab, classes):
     b, _ = _classes(classes, classes)
     _admit[(slots.numel(),)](mode, params, tokens, out, accepted, start, end, leftpad, step, remaining, seed, block,
-                             slots, offsets, blocks, prompt, prompt_len, window, prompt.shape[1], vocab, *b, **LAUNCH)
+                             slots, offsets, blocks, prompt, prompt_len, window, prompt.shape[1], vocab, min(classes),
+                             *b, **LAUNCH)
 
 
 @triton.jit

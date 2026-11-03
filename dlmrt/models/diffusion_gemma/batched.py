@@ -2,7 +2,8 @@
 forward runs a bucket of rows in which request p owns a contiguous range of B_p rows (B_p one of the engine's canvas
 lengths, at most four), and each request's rows follow its mode, kept at its KV slot:
 
-    PREFILL      the request's next B_p prompt tokens, causal (GemmaEngine's prefill chunks)
+    PREFILL      the request's next B_p prompt tokens, causal (GemmaEngine's prefill chunks); with `prefill`, longer
+                 chunks, after which the request parks (as SWITCH) until it has rows of its canvas length
     DENOISE      a round of the request's canvas of B_p positions (self-conditioned, bidirectional over the canvas)
     COMMIT       the stopped canvas's causal re-encode
     SWITCH       between two canvases, parked until the host gives it rows of another length
@@ -58,7 +59,7 @@ class _Request:
     rid: int
     slot: int
     admitted: float
-    block: int  # its rows (canvas length)
+    block: int  # its rows (prefill chunk / canvas length)
     offset: int = -1  # its first row in the last launch (-1: none yet)
     clock: int = 0  # forwards the run had done when it was admitted
 
@@ -108,10 +109,10 @@ FORWARD_FIXED, HEAD_COST = 600, 0.7
 def row_buckets(blocks, max_batch, max_rows=None, lanes=0):
     """Rows per forward the engine captures a loop for (and the expert kernels are tuned for): N x B for the batch
     buckets N at one canvas length B; at several (or with `lanes` rows of commit lanes on top, or more rows than
-    max_batch x B), the MoE token buckets from the shortest length up to `max_rows` (default max_batch x the shortest
-    length). Lanes add the rungs (the MoE token buckets to 4096, then every LANE_STEP rows) that are multiples of the
-    shortest length, up to the first that holds `lanes` more rows, below `max_rows` too (request rows of 64-canvases
-    between 4096 and 8192)."""
+    max_batch x B for prompt chunks), the MoE token buckets from the shortest length up to `max_rows` (default
+    max_batch x the shortest length). Lanes add the rungs (the MoE token buckets to 4096, then every LANE_STEP rows)
+    that are multiples of the shortest length, up to the first that holds `lanes` more rows, below `max_rows` too
+    (request rows of 64-canvases between 4096 and 8192)."""
     b0 = min(blocks)
     top = max_rows or max_batch * b0
     if len(blocks) == 1 and not lanes and top <= max_batch * b0:
@@ -170,11 +171,12 @@ class LoadPolicy:
         return self.tiers[tier][1]
 
 
-def sizes(blocks, max_batch, max_rows=None, *, fused=False, lane_cap=0.4, lane_min=8, lane_block=64, **_):
+def sizes(blocks, max_batch, max_rows=None, *, fused=False, lane_cap=0.4, lane_min=8, lane_block=64, prefill=None,
+          **_):
     """(the batch's row budget, rows per commit lane (0: no lanes), the row buckets) of an engine with these options
     (see BatchedGemmaEngine; the others do not size it), from which its model is built."""
     b0 = min(blocks)
-    max_rows = max_rows or max(max_batch * b0, max(blocks))
+    max_rows = max_rows or max(max_batch * b0, max(blocks)) + (prefill or 0)
     size = lane_size(blocks, lane_block) if fused and max_batch >= lane_min else 0
     lanes = lane_rows(max_batch, b0, lane_cap, size) if size else 0
     return max_rows, size, row_buckets(blocks, max_batch, max_rows, lanes)
@@ -182,11 +184,17 @@ def sizes(blocks, max_batch, max_rows=None, *, fused=False, lane_cap=0.4, lane_m
 
 class BatchedGemmaEngine:
     def __init__(self, model, decoder=None, max_batch=8, *, blocks=None, stops=None, policy=None, max_rows=None,
-                 fused=False, lane_share=None, lane_cap=0.4, lane_min=8, lane_block=64):
+                 fused=False, lane_share=None, lane_cap=0.4, lane_min=8, lane_block=64, prefill=None):
         """`blocks`: the canvas lengths requests may use (one to four powers of two; default the checkpoint's
         canvas_length), `stops`: {length: GemmaDecode stop rule} (default the decoder's for every length), `policy`:
         n -> the canvas length for a batch of n requests (default the longest; see LoadPolicy), `max_rows`: the rows a
-        batch may hold, which bounds admission (default max_batch x the shortest length, at least the longest).
+        batch may hold, which bounds admission (default max_batch x the shortest length, at least the longest, plus
+        `prefill`).
+
+        `prefill`: rows of a prompt chunk, a multiple of the shortest length (default: the request's canvas length).
+        A request is admitted with min(prefill, its prompt rounded up to the shortest length) rows if that is more
+        than its canvas length, and parks after its prompt until the host gives it canvas rows; the chunk's rows
+        count against `max_rows`. Numerics differ from GemmaEngine's (other row counts).
 
         `fused`: commit a stopped canvas in a commit lane, in the same forward as the next canvas's first round
         (numerics differ from GemmaEngine's: other row counts). A launch of n >= `lane_min` requests at a canvas
@@ -216,10 +224,13 @@ class BatchedGemmaEngine:
         self.policy = policy or (lambda n: self.blocks[0])
         if not set(getattr(self.policy, "blocks", ())) <= set(self.blocks):
             raise ValueError(f"the policy's canvas lengths {self.policy.blocks} are not all in {self.blocks}")
-        self.max_batch = max_batch
+        if prefill is not None and (prefill < b0 or prefill % b0):
+            raise ValueError(f"prefill must be a multiple of the shortest canvas length {b0}")
+        self.max_batch, self.prefill = max_batch, prefill
         self.lane_min, self.lane_block, self.lane_cap = lane_min, lane_block, lane_cap
         self.max_rows, self.lane_size, self.row_buckets = sizes(
-            self.blocks, max_batch, max_rows, fused=fused, lane_cap=lane_cap, lane_min=lane_min, lane_block=lane_block)
+            self.blocks, max_batch, max_rows, fused=fused, lane_cap=lane_cap, lane_min=lane_min, lane_block=lane_block,
+            prefill=prefill)
         self.fused = self.lane_size > 0
         self.lane_share = lane_share if isinstance(lane_share, dict) or lane_share is None else \
             {b: lane_share for b in self.blocks}
@@ -231,9 +242,9 @@ class BatchedGemmaEngine:
         # one of the head's totals.
         self.totals = head_totals(self.row_buckets, self.max_rows, max_batch, b0, lane_cap, self.lane_size)
         self.heads = list(self.totals)
-        # A launch's rows are aligned to the largest of these that divides all its row counts (the shortest canvas in
-        # it); from 64 rows on the sliding layers' attention takes its default query tiles (a forward graph per
-        # alignment).
+        # A launch's rows are aligned to the largest of these that divides all its row counts (the shortest canvas, or
+        # less for prompt chunks); from 64 rows on the sliding layers' attention takes its default query tiles (a
+        # forward graph per alignment).
         self.aligns = sorted({min(b, 64) for b in self.blocks})
         self.idle = m.slots - 1
         dev = m.device
@@ -466,6 +477,11 @@ class BatchedGemmaEngine:
             return (max_new_tokens + self.b0 - 1) // self.b0 * self.b0
         return max_new_tokens - 1 + self.blocks[0]
 
+    def prompt_rows(self, prompt, block):
+        """The rows a request with a prompt of `prompt` tokens is admitted with, for canvases of `block` rows."""
+        rows = min(self.prefill or 0, -(-prompt // self.b0) * self.b0, self.max_rows // self.b0 * self.b0)
+        return rows if rows > block else block
+
     def _admit(self, ids, max_new_tokens, seed, slot):
         n = len(ids)
         self.prompt_np[slot, :n] = ids
@@ -633,12 +649,13 @@ class BatchedGemmaEngine:
             nonlocal taken
             rid, ids = pending.pop()
             ids = check_prompt(ids, max_new_tokens, m.config.vocab_size)
-            if max(len(ids) + self.span(max_new_tokens), -(-len(ids) // block) * block) > m.max_seq_len:
+            rows = self.prompt_rows(len(ids), block)
+            if max(len(ids) + self.span(max_new_tokens), -(-len(ids) // rows) * rows) > m.max_seq_len:
                 raise ValueError("Request exceeds max_seq_len")
             slot = free.pop()
             self._admit(ids, max_new_tokens, seed, slot)
             taken += 1
-            return _Request(rid, slot, time.perf_counter(), block, clock=clock)
+            return _Request(rid, slot, time.perf_counter(), rows, clock=clock)
 
         with torch.cuda.device(m.device):
             while pending or any(r is not None for r in batch):
@@ -655,7 +672,8 @@ class BatchedGemmaEngine:
                             want[r.slot] = r.block
 
                 def admissible():
-                    return pending and alive < limit() and used + target <= self.max_rows
+                    return pending and alive < limit() and \
+                        used + self.prompt_rows(len(pending[-1][1]), target) <= self.max_rows
 
                 for p in range(len(batch)):
                     if batch[p] is None and admissible():

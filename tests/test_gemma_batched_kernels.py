@@ -407,3 +407,24 @@ def test_claim_lanes():
     for name, other in (("without lanes", plain), ("no lane in the launch", run(count=0)[0])):
         assert other.mode[[s for s, _, _ in layout]].tolist() == [1, 1, 1, 1, 1, 1, 3], name
         assert torch.equal(other.tokens[:own], plain.tokens[:own]), name
+
+
+def test_prompt_chunks():
+    """Prompt chunks of a row count that is no canvas length (96 rows, a 100-token prompt): admit, the next chunk,
+    then the request parks for canvas rows, with and without lanes."""
+    from dlmrt.models.diffusion_gemma import kernels as gk
+
+    for fused in (False, True):
+        t = stage_state()
+        place(t, [(6, 96, 32)])
+        t.mode[6] = ADMIT
+        t.tokens.fill_(-7)
+        gk.admit(t.mode, t.P, t.tokens, t.canvas, t.accepted, t.start, t.end, t.left, t.step, t.remaining, t.seed,
+                 t.ordinal, t.slots, t.offsets, t.lengths, t.prompt, t.plen, W, V, BLOCKS)
+        torch.cuda.synchronize()
+        assert torch.equal(t.tokens[:96], t.prompt[6, :96]) and [t.start[6], t.end[6], t.mode[6]] == [0, 96, PREFILL]
+        advance(t, fused)
+        assert torch.equal(t.tokens[:4], t.prompt[6, 96:100]) and bool((t.tokens[4:96] == 0).all())
+        assert [t.start[6], t.end[6], t.mode[6]] == [96, 192, PREFILL]
+        advance(t, fused)
+        assert t.mode[6] == SWITCH and t.P[6, :2].tolist() == [100, 0] and t.ctrl[2] == 1

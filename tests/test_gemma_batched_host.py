@@ -6,7 +6,8 @@ launch's alignment; the row maps match the layout and rows past the batch map to
 carries between forwards (marked with its slot) followed it through every move; the batch stays within max_rows.
 With commit lanes: they start at the head bucket and the launch holds them; lane commits claimed in a launch's last
 forward reach the next launch's lanes with their tokens and row maps; the launch's rows are one of the head's
-prebuilt totals unless pending lane commits need more. Every request's canvases cover its tokens, and two runs with
+prebuilt totals unless pending lane commits need more. With prompt chunks: a request's first rows are min(prefill, its
+prompt rounded up) when that exceeds its canvas length. Every request's canvases cover its tokens, and two runs with
 the same seed are identical.
 """
 
@@ -31,7 +32,7 @@ class Device:
     def __init__(self, e, rng):
         self.e, self.rng = e, rng
         self.rounds, self.pos, self.emitted = {}, {}, {}
-        self.forwards = self.lane_commits = 0
+        self.forwards = self.lane_commits = self.chunks = 0
 
     @staticmethod
     def marker(s):
@@ -56,7 +57,8 @@ class Device:
             if s == e.idle:
                 continue
             o, n = int(e.offset[s]), int(e.length[s])
-            assert n in e.blocks and o % e.b0 == 0 and o + n <= head and not seen[o:o + n].any(), (s, o, n, head)
+            assert n in e.blocks or (int(e.mode[s]) == PREFILL and n % e.b0 == 0), (s, n)
+            assert o % e.b0 == 0 and o + n <= head and not seen[o:o + n].any(), (s, o, n, head)
             seen[o:o + n] = True
             used += n
             assert (e.row_slot[o:o + n] == s).all() and (e.row_index[o:o + n] == torch.arange(n)).all()
@@ -77,6 +79,7 @@ class Device:
             if int(e.mode[s]) == ADMIT:
                 e.mode[s] = PREFILL
                 self.pos[s], self.emitted[s] = 0, 0
+                self.chunks += n not in e.blocks
                 e.tokens[o:o + n] = self.marker(s)
             elif int(e.mode[s]) == SWITCH:
                 self.begin(s, n)
@@ -93,7 +96,13 @@ class Device:
             waiting = []
             for s in slots:  # advance
                 n, mode = int(e.length[s]), int(e.mode[s])
-                if mode == DENOISE:
+                if mode == PREFILL and n not in e.blocks:  # a prompt chunk
+                    self.pos[s] += n
+                    if self.pos[s] >= int(e.prompt_len[s]):
+                        e.params[s, 0], e.params[s, 1] = int(e.prompt_len[s]), 0
+                        e.mode[s] = SWITCH
+                        finished += 1
+                elif mode == DENOISE:
                     self.rounds[s] -= 1
                     if self.rounds[s] == 0:
                         k = int(e.params[s, 1])
@@ -185,17 +194,18 @@ def host(monkeypatch):
     torch.set_num_threads(threads)
 
 
-def trial(seed, blocks, max_batch, max_rows, concurrency, count, fused=False, lane_share=None):
+def trial(seed, blocks, max_batch, max_rows, concurrency, count, fused=False, lane_share=None, prefill=None):
     rng = random.Random(seed)
     tiers = tuple((n, b) for n, b in ((2, 256), (11, 128), (40, 64), (batched.LIMIT, 32)) if b in blocks)
     policy = batched.LoadPolicy(tiers) if len(blocks) > 1 else None
-    _, _, buckets = batched.sizes(blocks, max_batch, max_rows, fused=fused)
+    max_rows += prefill or 0
+    _, _, buckets = batched.sizes(blocks, max_batch, max_rows, fused=fused, prefill=prefill)
     config = types.SimpleNamespace(block_size=max(blocks), hidden_size=4, eos_token_ids=(EOS,), vocab_size=1 << 18,
                                    sliding_window=1024)
     model = types.SimpleNamespace(config=config, device="cpu", group=None, slots=max_batch + 1, max_rows=buckets[-1],
                                   vocab=8, max_seq_len=8192)
     e = batched.BatchedGemmaEngine(model, None, max_batch, blocks=blocks, policy=policy, max_rows=max_rows, fused=fused,
-                                   lane_share=lane_share)
+                                   lane_share=lane_share, prefill=prefill)
     device = Device(e, rng)
 
     def loop(rows, head, align):
@@ -214,6 +224,8 @@ def trial(seed, blocks, max_batch, max_rows, concurrency, count, fused=False, la
         assert r.token_ids[-1] == EOS or len(r.token_ids) == budget
         assert all(b in e.blocks for b in r.blocks) and r.first_forwards >= 1
         assert r.canvas_forwards == sorted(r.canvas_forwards) and r.canvas_forwards[0] >= r.admitted_forward
+    if prefill and prefill > min(blocks) and max_batch > 1:
+        assert device.chunks > 0
     return [(t["n"], t["bucket"], t["head"], t["lanes"], t["mix"]) for t in e.trace], \
         [(r.token_ids, r.blocks, r.canvas_forwards) for r in results], device
 
@@ -228,7 +240,8 @@ CASES = {
     "one-request": ((256,), 1, 256, 1, 5),
     "small-switching": ((256, 32), 8, 512, [(1, 3), (8, 40), (1, 3)], 46),
 }
-OPTIONS = {"plain": {}, "fused": {"fused": True}, "fused-fixed-share": {"fused": True, "lane_share": 0.1}}
+OPTIONS = {"plain": {}, "fused": {"fused": True}, "fused-fixed-share": {"fused": True, "lane_share": 0.1},
+           "prefill-128": {"prefill": 128}, "fused-prefill-256": {"fused": True, "prefill": 256}}
 
 
 @pytest.mark.parametrize("case", list(CASES))
@@ -236,6 +249,9 @@ OPTIONS = {"plain": {}, "fused": {"fused": True}, "fused-fixed-share": {"fused":
 def test_host_loop(host, case, option):
     blocks, max_batch, max_rows, concurrency, count = CASES[case]
     options = OPTIONS[option]
+    prefill = options.get("prefill")
+    if prefill and prefill % min(blocks):
+        pytest.skip("prefill is not a multiple of the shortest canvas length")
     launches, results, device = trial(0, blocks, max_batch, max_rows, concurrency, count, **options)
     assert trial(0, blocks, max_batch, max_rows, concurrency, count, **options)[:2] == (launches, results), \
         "not reproducible"
