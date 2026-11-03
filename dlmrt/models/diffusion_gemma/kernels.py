@@ -13,12 +13,15 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from ...ops.triton.common import LAUNCH, _bf, _geglu_row, _groups, _release, _rms, _row_tile, _store_bf16, _wait
-
+from .config import STOP_RULES
 
 # Philox stream offsets per use, above the 256 x 262144 sampling range.
 INIT_STREAM = tl.constexpr(1 << 28)
 
 RENOISE_STREAM = tl.constexpr(1 << 29)
+
+# `decide`'s STOP code of each GemmaDecode.stop_rule.
+STOPS = {name: code for code, name in enumerate(STOP_RULES)}
 
 
 @triton.jit
@@ -483,7 +486,8 @@ def begin(params, tokens, out, accepted, start, end, leftpad, step, remaining, s
 
 @triton.jit
 def _decide(STATS, ARGMAX, SAMPLE, TOKENS, OUT, ACCEPTED, STEP, REMAINING, SEED, BLOCK, BAD, bound, confidence,
-            VOCAB: tl.constexpr, B: tl.constexpr, ADAPTIVE: tl.constexpr, HAS_BAD: tl.constexpr = False):
+            VOCAB: tl.constexpr, B: tl.constexpr, ADAPTIVE: tl.constexpr, STOP: tl.constexpr = 0,
+            HAS_BAD: tl.constexpr = False):
     """A position whose logits row had no argmax / sample (logit_stats' 2147483647 for a row of NaN) is never taken:
     it is re-noised, and its argmax-canvas entry is that noise (no token outside the vocabulary leaves the decoder).
     HAS_BAD: *BAD += those positions."""
@@ -492,23 +496,47 @@ def _decide(STATS, ARGMAX, SAMPLE, TOKENS, OUT, ACCEPTED, STEP, REMAINING, SEED,
     step = tl.load(STEP)
     entropy = tl.load(STATS + i * 2 + 1)
     rkey = _key(tl.load(SEED), tl.load(BLOCK), step)
-    # Nonnegative float bits sort numerically; the index breaks ties deterministically.
-    key = (entropy.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | i.to(tl.uint64)
-    order = (tl.sort(key, descending=False) & 0xFFFFFFFF).to(tl.int32)
-    h = tl.gather(entropy, order, 0)
-    sample = tl.load(SAMPLE + order)
-    take = ((tl.cumsum(h, 0) - h) <= bound) & (sample >= 0) & (sample < VOCAB)
-    noise = tl.randint(rkey, RENOISE_STREAM + order) % VOCAB
-    tl.store(TOKENS + order, tl.where(take, sample, noise.to(tl.int64)))
-    if ADAPTIVE:  # the next round's temperature averages over the positions not accepted here
-        tl.store(ACCEPTED + order, take.to(tl.int8))
-    argmax = tl.load(ARGMAX + i)
-    bad = (argmax < 0) | (argmax >= VOCAB)
-    argmax = tl.where(bad, (tl.randint(rkey, RENOISE_STREAM + i) % VOCAB).to(tl.int64), argmax)
-    stable = (step > 0) & (tl.sum((argmax != tl.load(OUT + i)).to(tl.int32), 0) == 0)
-    confident = tl.sum(entropy, 0) / B < confidence
-    tl.store(OUT + i, argmax)
-    tl.store(REMAINING, tl.where(stable & confident, 0, 1))
+    if STOP > 0:
+        # Freeze: an accepted position keeps its token for the rest of the canvas (ACCEPTED is cumulative; begin
+        # clears it); each round accepts the lowest-entropy unfrozen positions within the bound (at least one), and
+        # the canvas stops once every position is frozen. STOP 1 freezes the sample, STOP 2 the argmax.
+        frozen = tl.load(ACCEPTED + i) != 0
+        hkey = tl.where(frozen, 1.0e9, entropy)
+        key = (hkey.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | i.to(tl.uint64)
+        order = (tl.sort(key, descending=False) & 0xFFFFFFFF).to(tl.int32)
+        h = tl.gather(hkey, order, 0)
+        fz = tl.gather(frozen.to(tl.int32), order, 0) != 0
+        noise = tl.randint(rkey, RENOISE_STREAM + order) % VOCAB
+        current = tl.load(TOKENS + order)
+        argmax = tl.load(ARGMAX + order)
+        chosen = argmax if STOP == 2 else tl.load(SAMPLE + order)
+        bad = (argmax < 0) | (argmax >= VOCAB) | (chosen < 0) | (chosen >= VOCAB)
+        take = ((tl.cumsum(h, 0) - h) <= bound) & (fz == 0) & (bad == 0)
+        new = tl.where(fz, current, tl.where(take, chosen, noise.to(tl.int64)))
+        tl.store(TOKENS + order, new)
+        done = fz | take
+        tl.store(ACCEPTED + order, done.to(tl.int8))
+        tl.store(OUT + order, tl.where(done | bad, new, argmax))
+        remaining = tl.where(tl.sum(done.to(tl.int32), 0) == B, 0, 1)
+    else:
+        # Nonnegative float bits sort numerically; the index breaks ties deterministically.
+        key = (entropy.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | i.to(tl.uint64)
+        order = (tl.sort(key, descending=False) & 0xFFFFFFFF).to(tl.int32)
+        h = tl.gather(entropy, order, 0)
+        sample = tl.load(SAMPLE + order)
+        take = ((tl.cumsum(h, 0) - h) <= bound) & (sample >= 0) & (sample < VOCAB)
+        noise = tl.randint(rkey, RENOISE_STREAM + order) % VOCAB
+        tl.store(TOKENS + order, tl.where(take, sample, noise.to(tl.int64)))
+        if ADAPTIVE:  # the next round's temperature averages over the positions not accepted here
+            tl.store(ACCEPTED + order, take.to(tl.int8))
+        argmax = tl.load(ARGMAX + i)
+        bad = (argmax < 0) | (argmax >= VOCAB)
+        argmax = tl.where(bad, (tl.randint(rkey, RENOISE_STREAM + i) % VOCAB).to(tl.int64), argmax)
+        stable = (step > 0) & (tl.sum((argmax != tl.load(OUT + i)).to(tl.int32), 0) == 0)
+        confident = tl.sum(entropy, 0) / B < confidence
+        tl.store(OUT + i, argmax)
+        remaining = tl.where(stable & confident, 0, 1)
+    tl.store(REMAINING, remaining)
     tl.store(STEP, step + 1)
     if HAS_BAD:
         missing = tl.sum(bad.to(tl.int32), 0)
@@ -518,9 +546,11 @@ def _decide(STATS, ARGMAX, SAMPLE, TOKENS, OUT, ACCEPTED, STEP, REMAINING, SEED,
 
 
 def decide(stats, argmax, sample, tokens, out, accepted, step, remaining, seed, block, config, vocab, bad=None):
-    """Keep samples at the lowest-entropy positions within the entropy bound, re-noise the rest; stop once the
-    argmax canvas is unchanged and the mean entropy is below the confidence threshold. A position whose logits are
-    NaN is re-noised; `bad` (int32, one element) counts them."""
+    """Keep samples at the lowest-entropy positions within the entropy bound, re-noise the rest, under the decoder's
+    stop rule (GemmaDecode.stop_rule): "renoise" stops once the argmax canvas is unchanged and the mean entropy is
+    below the confidence threshold; "freeze" / "freeze_argmax" keep accepted samples / argmax tokens and stop once
+    every position is accepted. A position whose logits are NaN is re-noised; `bad` (int32, one element) counts
+    them."""
     _decide[(1,)](stats, argmax, sample, tokens, out, accepted, step, remaining, seed, block,
                   bad if bad is not None else step, config.entropy_bound, config.confidence_threshold, vocab,
-                  tokens.numel(), config.adaptive, bad is not None, num_warps=4, **LAUNCH)
+                  tokens.numel(), config.adaptive, STOPS[config.stop_rule], bad is not None, num_warps=4, **LAUNCH)

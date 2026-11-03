@@ -30,7 +30,8 @@ class GemmaConfig:
     final_logit_softcapping: float = 30.0
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, canvas_length=None):
+        """`canvas_length`: run canvases of this length instead of the checkpoint's (see GemmaDecode.stop_rule)."""
         path = Path(path)
         raw = json.loads((path / "config.json").read_text())
         if raw.get("model_type") != "diffusion_gemma":
@@ -52,7 +53,7 @@ class GemmaConfig:
         types = tuple(t["layer_types"])
         if set(types) != {"sliding_attention", "full_attention"}:
             raise ValueError(f"Unknown layer types {set(types)}")
-        canvas = raw.get("canvas_length", 256)
+        canvas = canvas_length or raw.get("canvas_length", 256)
         if type(canvas) is not int or canvas < 1 or canvas & (canvas - 1):
             raise ValueError(f"canvas_length {canvas!r} must be a power of two (the decoder kernels' tl.arange spans it)")
         eos = raw.get("eos_token_id", t.get("eos_token_id"))
@@ -74,6 +75,9 @@ class GemmaConfig:
                    final_logit_softcapping=t.get("final_logit_softcapping", 30.0))
 
 
+STOP_RULES = ("renoise", "freeze", "freeze_argmax")
+
+
 @dataclass(frozen=True)
 class GemmaDecode:
     """Uniform-state decoder of the reference: sample every canvas position at an annealed temperature, keep the
@@ -84,7 +88,13 @@ class GemmaDecode:
     (the ORL decoder, as the paper's vLLM decoder applies it): round 0 runs at t_max and records the normalized
     raw-logit entropy averaged over the canvas; later rounds run at min(previous T, t_min + (t_max - t_min) *
     (entropy / reference) ** adaptive_power), the entropy averaged over the positions the previous round did not
-    accept."""
+    accept.
+
+    `stop_rule`: "renoise" is the reference's rule above. Canvases shorter than the 256 the checkpoints were trained
+    on rarely satisfy its mean-entropy test and run to max_denoising_steps; "freeze" keeps every accepted sample for
+    the rest of the canvas (each round accepts at least one position, the entropy bound counted over the positions
+    not yet accepted) and stops once every position is accepted, "freeze_argmax" does the same with the argmax token
+    of an accepted position instead of its sample."""
 
     entropy_bound: float = 0.1
     t_min: float = 0.4
@@ -95,6 +105,7 @@ class GemmaDecode:
     seed: int = 1234
     temperature_mode: str = "linear"
     adaptive_power: float = 0.5
+    stop_rule: str = "renoise"
 
     def __post_init__(self):
         if self.stability_threshold != 1:
@@ -103,6 +114,8 @@ class GemmaDecode:
             raise ValueError("Invalid decoder settings")
         if self.temperature_mode not in ("linear", "adaptive_scalar") or self.adaptive_power <= 0:
             raise ValueError("temperature_mode must be linear or adaptive_scalar (with a positive power)")
+        if self.stop_rule not in STOP_RULES:
+            raise ValueError(f"stop_rule must be one of {STOP_RULES}")
 
     @property
     def adaptive(self):

@@ -164,6 +164,38 @@ def test_attention_one_split_window(block_m):
         assert rel(out[0], sliding_reference(q, k, v, start, window)) < 5e-3, start
 
 
+@pytest.mark.parametrize("sliding", [True, False])
+def test_attention_short_canvas(sliding):
+    """DiffusionGemma's attention at 32-row canvases (query tiles halved to divide them): canvas rows over
+    [leftpad, end), causal rows (the commit) within the window."""
+    import types
+
+    from dlmrt.models.diffusion_gemma.attention import Attention
+
+    hq, hk, d, window, rows, cap, start = (16, 8, 256, 1024, 32, 2048, 1300) if sliding else (16, 2, 512, 1024, 32,
+                                                                                              2048, 700)
+    att = Attention(types.SimpleNamespace(sliding_window=window, head_dim=256), dev, cap, torch.bfloat16)
+    k = torch.randn(1, cap, hk, d, device=dev).to(torch.bfloat16)
+    v = torch.randn(1, cap, hk, d, device=dev).to(torch.bfloat16)
+    q = (torch.randn(1, rows, hq, d, device=dev) * 0.2).to(torch.bfloat16)
+    i32 = {"device": dev, "dtype": torch.int32}
+    s, e = torch.tensor([start], **i32), torch.tensor([start + rows], **i32)
+    left = max(0, start - (window - 1)) if sliding else 0
+    leftpad = torch.tensor([left], **i32)
+    end = start + rows
+    kk = k[0, :end].float().repeat_interleave(hq // hk, 1)
+    vv = v[0, :end].float().repeat_interleave(hq // hk, 1)
+    scores = torch.einsum("qhd,khd->hqk", q[0].float(), kk)
+    kpos = torch.arange(end, device=dev)[None, :]
+    canvas = att(sliding, q, k, v, s, e, leftpad, False, 1, None)
+    ref = torch.einsum("hqk,khd->qhd", scores.masked_fill(~(kpos >= left).expand(rows, end)[None], float("-inf"))
+                       .softmax(-1), vv)
+    assert rel(canvas[0], ref) < 5e-3
+    commit = att(sliding, q, k, v, s, e, leftpad, True, 1, None)
+    ref = sliding_reference(q, k, v, start, window if sliding else cap)
+    assert rel(commit[0], ref) < 5e-3
+
+
 @pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize("sliding", [True, False])
 def test_qkv_norm_rope(sliding, split):
@@ -263,13 +295,14 @@ def test_logit_stats_and_decide(rand4):
     assert int(remaining) == 0  # argmax unchanged and confident
 
 
-def test_decide_nan_rows():
+@pytest.mark.parametrize("stop_rule", ["renoise", "freeze_argmax"])
+def test_decide_nan_rows(stop_rule):
     """Rows of NaN logits (logit_stats finds no argmax / sample) are re-noised and counted; no token leaves the
     vocabulary."""
     from dlmrt.models.diffusion_gemma import kernels as gk
     from dlmrt.models.diffusion_gemma import GemmaDecode
 
-    v, cap, d = 262144, 30.0, GemmaDecode()
+    v, cap, d = 262144, 30.0, GemmaDecode(stop_rule=stop_rule)
     logits = (torch.randn(T, v, device=dev) * 3).to(torch.bfloat16)
     logits[:T // 4, 7] = 60.0
     nan = torch.zeros(T, dtype=torch.bool, device=dev)
@@ -288,7 +321,47 @@ def test_decide_nan_rows():
     assert int(bad) == int(nan.sum())
     assert bool(((tokens >= 0) & (tokens < v)).all()) and bool(((canvas >= 0) & (canvas < v)).all())
     assert not bool(accepted[nan].any())
-    assert bool((tokens[~nan & (sample == 7)] == 7).all())
+    taken = ~nan & (sample == 7) & (accepted != 0) if stop_rule != "renoise" else ~nan & (sample == 7)
+    assert bool((tokens[taken] == 7).all())
+
+
+@pytest.mark.parametrize("stop_rule", ["freeze", "freeze_argmax"])
+def test_decide_freeze(stop_rule):
+    """Freeze rules over rounds against a transcription: accepted positions keep their token; each round accepts the
+    lowest-entropy positions not yet accepted within the bound (at least one); the canvas stops once all are."""
+    from dlmrt.models.diffusion_gemma import kernels as gk
+    from dlmrt.models.diffusion_gemma import GemmaDecode
+
+    b, v, d = 32, 262144, GemmaDecode(stop_rule=stop_rule, entropy_bound=0.3)
+    i32 = {"device": dev, "dtype": torch.int32}
+    step, seed, block, remaining = (torch.tensor([x], **i32) for x in (0, 1234, 3, 1))
+    tokens = torch.randint(0, v, (b,), device=dev)
+    canvas = torch.full((b,), -1, device=dev, dtype=torch.int64)
+    accepted = torch.zeros(b, device=dev, dtype=torch.int8)
+    frozen = torch.zeros(b, dtype=torch.bool, device=dev)
+    kept = tokens.clone()
+    for r in range(b + 1):
+        stats = torch.zeros(b, 2, device=dev)
+        stats[:, 1] = torch.rand(b, device=dev) * 0.2
+        argmax, sample = torch.randint(0, v, (b,), device=dev), torch.randint(0, v, (b,), device=dev)
+        chosen = argmax if stop_rule == "freeze_argmax" else sample
+        before = tokens.clone()
+        gk.decide(stats, argmax, sample, tokens, canvas, accepted, step, remaining, seed, block, d, v)
+        h = torch.where(frozen, torch.full_like(stats[:, 1], 1e9), stats[:, 1])
+        order = torch.argsort(h, stable=True)
+        hs = h[order]
+        take = torch.zeros(b, dtype=torch.bool, device=dev)
+        take[order] = ((hs.cumsum(0) - hs) <= d.entropy_bound) & ~frozen[order]
+        assert bool(take.any() | frozen.all())
+        assert torch.equal(tokens[frozen], before[frozen]) and torch.equal(tokens[take], chosen[take])
+        kept[take] = chosen[take]
+        frozen |= take
+        assert torch.equal(accepted.bool(), frozen) and torch.equal(canvas[frozen], kept[frozen])
+        assert torch.equal(canvas[~frozen], argmax[~frozen])
+        assert int(step) == r + 1 and int(remaining) == int(not frozen.all())
+        if frozen.all():
+            break
+    assert bool(frozen.all())
 
 
 def test_adaptive_temperature():

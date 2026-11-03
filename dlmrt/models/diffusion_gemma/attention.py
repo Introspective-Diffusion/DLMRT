@@ -53,7 +53,13 @@ class Attention:
                                       num_splits=splits)
 
     def __call__(self, sliding, q, k, v, start, end, leftpad, causal, splits, schedule):
-        tiles = self.tiles(sliding, k.shape[2])
+        tiles = dict(self.tiles(sliding, k.shape[2]))
+        query_rows = q.shape[1] * q.shape[2] // k.shape[2]
+        if "block_m" in tiles and query_rows % tiles["block_m"]:
+            # Short canvases: halve the query tile until it divides the rows (Triton's dot needs >= 16).
+            while tiles["block_m"] > 16 and query_rows % tiles["block_m"]:
+                tiles["block_m"] //= 2
+            tiles["num_warps"] = min(tiles.get("num_warps", 4), 4)
         if not sliding:
             return attention(q, k, v, start, end, causal, **tiles)
         w = self.config.sliding_window - 1

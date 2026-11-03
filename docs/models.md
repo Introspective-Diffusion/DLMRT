@@ -106,6 +106,12 @@ uniform-state block diffusion on a Gemma 4 mixture-of-experts backbone. The ORL 
 - **Roles**: `base` (entropy bound 0.1, temperature 0.8 → 0.4 linearly) and `orl` (entropy bound 0.12, temperature
   from 0.8 down to 0.5 driven by the raw-logit entropy of the positions not yet accepted). `entropy_bound`
   overrides the role's bound.
+- **Canvas length and stop rule**: `GemmaModel.load(..., canvas_length=N)` runs canvases of N rows (a power of two)
+  instead of the checkpoint's 256. The reference stop rule rarely stops canvases below 64 rows before the 48-round
+  cap; `GemmaDecode(stop_rule="freeze")` keeps every accepted sample for the rest of the canvas and stops once every
+  position is accepted, `"freeze_argmax"` keeps the accepted position's argmax token instead (on the ORL checkpoint,
+  first 400 GSM8K problems, one seed: 91% accuracy at 32-row canvases with 10 tokens per round, against 92% and 29 at
+  256 rows under the reference rule).
 - **Prompts**: the tokenizer's chat template; `thinking=False` passes `enable_thinking=False` (the answer then opens
   with an empty thought channel, which the API hides).
 - **Precision** (`precision`): `bf16`, or `nvfp4` for ModelOpt NVFP4 exports: W4A4 experts (E2M1 weights with an FP8

@@ -188,10 +188,10 @@ class GemmaModel:
             self.experts.calibrate(self)
 
     @classmethod
-    def load(cls, path, max_seq_len=16384, *, device=None, group=None, precision=None):
+    def load(cls, path, max_seq_len=16384, *, device=None, group=None, precision=None, canvas_length=None):
         """`precision`: "bf16" or "nvfp4" (an NVFP4 checkpoint), default the checkpoint's own (see precision.py).
-        Under TP each rank reads only its experts."""
-        config = GemmaConfig.load(path)
+        Under TP each rank reads only its experts. `canvas_length`: see GemmaConfig.load."""
+        config = GemmaConfig.load(path, canvas_length)
         device = device or (group.device if group else "cuda:0")
         precision = precision_switch.resolve(path, precision, device, backends=("trtllm", "cutlass"))
         weights = precisions.read_weights(path, config, precision, device, group)
