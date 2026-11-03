@@ -1,6 +1,7 @@
 # Architecture
 
-dlmrt serves one request at a time and optimizes that request's tokens per second. Block-diffusion models generate
+dlmrt optimizes a single request's tokens per second and, for DiffusionGemma, also serves many requests per forward on
+one GPU ([the batched launch graph](#the-batched-launch-graph)). Block-diffusion models generate
 a block of tokens (32 or 256) at a time: a block starts as noise and is refined by several bidirectional forward
 passes ("denoise rounds") over the whole block until the decoder accepts every position; a causal "commit" pass then
 writes the block's keys and values for the blocks after it.
@@ -28,6 +29,29 @@ store, the patched DeepGEMM GEMM and the post-attention megakernel after their m
 row kernels that wait anyway. A kernel followed by a GEMM must release only after its last store, and from threads
 that do work; an early release makes the next GEMM's CTAs land out of order.
 
+## The batched launch graph
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/batched-launch-dark.svg">
+  <img alt="One launch of DiffusionGemma's batched engine. On the host, between launches: launch the graph for the row
+  count; no host step until a request finishes or parks; then collect the finished requests, pick the canvas length
+  from the load, admit waiting requests within max_rows, lay out the rows, size the commit lanes and launch again. On
+  the device: admit, then a WHILE loop of the forward over all rows, the LM head and decoder (if a canvas round),
+  advance and claim, and self-conditioning (if a round past 0 follows), run while some request runs and none has
+  finished or parked since the launch. Each request owns a contiguous range of the forward's rows (a canvas round, a
+  commit or prompt rows), followed by padding and commit lanes." src="../assets/batched-launch-light.svg"
+  width="100%">
+</picture>
+
+DiffusionGemma's batched engine (`dlmrt/models/diffusion_gemma/batched.py`, one GPU) runs many requests through one
+`StagedLoopGraph`: the block graph's WHILE loop with a fixed body (forward, LM head and decoder, advance,
+self-conditioning), the decoder and the self-conditioning under IF nodes, after an admit stage. Every request owns a
+contiguous range of each forward's rows and keeps its stage (prompt rows, a canvas round, a commit) at its KV slot;
+after each forward `advance` moves every request on by itself, and the loop exits when a request finishes or parks
+for a canvas of another length. Between launches the host collects finished requests, picks the canvas length from
+the load, admits waiting requests, lays out the rows and relaunches. The stages, the scheduling and the measurements:
+[batched.md](batched.md#how-it-works).
+
 ## Code map
 
 | Package | Role |
@@ -36,6 +60,7 @@ that do work; an early release makes the next GEMM's CTAs land out of order.
 | `dlmrt/models/<family>/model.py` | weights (sharded under TP), the KV cache, the block forward |
 | `dlmrt/models/<family>/engine.py` | request state, graph capture, the host loop over blocks |
 | `dlmrt/models/{llada2,diffusion_gemma}/kernels.py` | Triton kernels particular to the family |
+| `dlmrt/models/diffusion_gemma/batched.py` | `BatchedGemmaEngine`: many DiffusionGemma requests per forward (one GPU), per-request stages and canvas lengths, the load policy, commit lanes, the host loop |
 | `dlmrt/models/diffusion_gemma/{attention,experts,precision}.py` | DiffusionGemma's attention (FA3, Triton) and routed-expert (DeepGEMM, TRT-LLM-gen, CUTLASS) backends, its checkpoint reading per precision |
 | `dlmrt/models/{llada2,sdar}/sglang_numerics.py`, `sglang_kernels.py` | the SGLang-numerics modes: the paper runtime's forward and decisions in dlmrt's block graphs, and the kernels that reproduce its reductions bit for bit |
 | `dlmrt/ops/triton/` | shared Triton kernels: PDL plumbing and numerics helpers (`common`), norms / SwiGLU / FP8 quantization / Q/K-RoPE / embedding (`core`), the QwenDLM and LLaDA2 decoder (`decoding`), MoE routing and the masked expert layout (`moe`), flash attention where FA3 does not run (`attention`), on SM 12.x the NVFP4 MoE with the TRT-LLM-gen MoE's roundings (`nvfp4_moe`), BF16 GEMMs in cuBLAS's B200 summation order (`gemm`) and a Gluon attention in the B200 kernel's summation order (`b200_attention`), for the SGLang-numerics modes SGLang's fused MoE (`sglang_fused_moe`, vendored) and QK norm + RoPE (`sglang_rope`) |

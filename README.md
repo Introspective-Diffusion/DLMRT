@@ -5,7 +5,7 @@
   <img alt="dlmrt" src="assets/dlmrt-logo-light.svg" width="400">
 </picture>
 
-**A single-request inference engine for block-diffusion language models**
+**An inference engine for block-diffusion language models: fast single requests and batched serving**
 
 [Paper](https://arxiv.org/abs/2610.20687) · [Project page](https://introspective-diffusion.github.io/orl-dlm) · [ORL code](https://github.com/Introspective-Diffusion/ORL) ·
 [Checkpoints](https://huggingface.co/collections/yifanyu/orl-on-policy-residual-learning-for-diffusion-lms)
@@ -15,11 +15,14 @@
 
 </div>
 
-dlmrt runs one request at a time and makes that request fast. Every forward denoises a whole block of tokens, and the
-denoising loop runs on the GPU. It serves QwenDLM, LLaDA2.1-mini and DiffusionGemma checkpoints on one GPU or tensor
+dlmrt makes a single request fast and, for DiffusionGemma, batches many requests into each forward. Every forward
+denoises whole blocks of tokens, and the denoising loop runs on the GPU. It serves QwenDLM, LLaDA2.1-mini and DiffusionGemma checkpoints on one GPU or tensor
 parallel across an NVLink node, on NVIDIA Hopper (H100) and, for LLaDA2.1-mini and DiffusionGemma, Blackwell (B200,
 B300; NVFP4 also on the RTX 5090). It is the inference engine of
 [On-Policy Residual Learning for Diffusion Language Models](https://arxiv.org/abs/2610.20687) (ORL).
+
+The DiffusionGemma batched engine runs on one GPU: many requests per forward, each at its own stage and with a canvas
+length chosen from the load ([docs/batched.md](docs/batched.md)).
 
 ## Highlights
 
@@ -37,6 +40,12 @@ B300; NVFP4 also on the RTX 5090). It is the inference engine of
   and DiffusionGemma (FlashInfer's TRT-LLM-gen MoE; on RTX 50-series GPUs dlmrt's Triton MoE with the TRT-LLM-gen
   MoE's roundings for LLaDA2, bitwise the B200's in all but about 0.2% of rows, and FlashInfer's CUTLASS MoE for
   DiffusionGemma), with an FP8 KV cache.
+- **Batched DiffusionGemma.** Requests share forwards in ragged rows, each in its own stage (prompt chunk, canvas
+  round, commit) switched on the GPU; canvases of 256, 128 or 32 rows by load, with commits fused into the next
+  canvas's first round. On one B200 (GSM8K prompts, closed loop) it reaches 23.7K tok/s at 128 concurrent requests,
+  1.1–3.8× vLLM's DFlash speculative decoding from 1 to 128 requests
+  ([measurements and caveats](docs/batched.md#measured-on-one-b200)), and emits GemmaEngine's tokens for a request that
+  runs alone.
 
 ## Supported models
 
@@ -68,6 +77,24 @@ paper's: on H100, QwenDLM and LLaDA2 run the SGLang-numerics mode and DiffusionG
 on one B200, DiffusionGemma averages seeds 1234–1236. The round latencies and TP=8 run dlmrt's default numerics
 (DiffusionGemma at seed 1234), which reach 1658 (QwenDLM), 2060 (LLaDA2) and 1388 (DiffusionGemma) request TPS at TP=1
 on H100. Methodology and every measurement: [docs/performance.md](docs/performance.md).
+
+### Batched serving
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/throughput-b200-dark.svg">
+  <img alt="Throughput on one B200 at 1, 2, 4, 8, 16 and 32 requests in flight: dlmrt's batched DiffusionGemma 4.3K,
+  5.8K, 8.1K, 10.2K, 14.6K and 17.5K tok/s; vLLM with DFlash 1.1K, 2.1K, 3.6K, 6.5K, 9.3K and 13.9K; vLLM
+  autoregressive 0.3K, 0.7K, 1.2K, 2.1K, 3.7K and 5.9K. dlmrt is 3.8, 2.8, 2.2, 1.6, 1.6 and 1.25 times DFlash."
+  src="assets/throughput-b200-light.svg" width="100%">
+</picture>
+
+DiffusionGemma + ORL through the batched engine on one B200, against Gemma 4 26B-A4B in vLLM 0.31 on the same
+prompts, autoregressive and with a DFlash drafter at its best draft length per concurrency: aggregate output tok/s in
+closed loop, mean of three runs. At 64 and 128 requests dlmrt reaches 21.2K and 23.7K tok/s (1.12× and 1.18× DFlash).
+Each request's canvas length follows the load: 256 rows for one or two requests, 128 up to 11, 32 beyond; under a load
+that rises from 1 to 64 requests and falls back, that is 1.06–1.87× the throughput of any single canvas length
+([canvas length by load](docs/batched.md#canvas-length-by-load)). Every measurement, the GSM8K accuracy per level and
+the caveats: [docs/batched.md](docs/batched.md#measured-on-one-b200).
 
 ## Installation
 
@@ -123,6 +150,8 @@ python -m dlmrt bench step --model CKPT    # round latency at fixed contexts
 torchrun --nproc-per-node 8 -m dlmrt bench humaneval --model CKPT --inputs openai_humaneval.parquet \
     --out results/he --full --repeats 1 --max-new-tokens 2048 [--role orl]
 python benchmarks/humaneval_score.py openai_humaneval.parquet results/he   # runs model-written code: use a sandbox
+# DiffusionGemma, batched engine on one GPU: closed loop at 1-128 concurrent requests
+python -m dlmrt bench throughput --model DG_CKPT --role orl --problems gsm8k.jsonl --out results/throughput
 ```
 
 ## Reproducing the papers
@@ -135,8 +164,9 @@ the results table, the settings and the scoring are in
 
 | | |
 | --- | --- |
-| [Architecture](docs/architecture.md) | the block graph, the device loop, kernels, tensor parallelism |
+| [Architecture](docs/architecture.md) | the block graph, the device loop, the batched launch graph, kernels, tensor parallelism |
 | [Models](docs/models.md) | the three families, their decoders, precisions and options |
+| [Batched DiffusionGemma](docs/batched.md) | the batched engine: running it, per-request stages, scheduling, B200 throughput |
 | [Performance](docs/performance.md) | latency, throughput and accuracy |
 | [Benchmarks](docs/benchmarks.md) | benchmark protocols and reproducing the papers |
 | [Server](docs/server.md) | `dlmrt serve` and its HTTP API |
@@ -148,7 +178,8 @@ the results table, the settings and the scoring are in
 ```
 dlmrt/
   llm.py           LLM: the Python API (also used by the server)
-  models/          sdar/, llada2/, diffusion_gemma/: config, model and engine per family, kernels where it has its own
+  models/          sdar/, llada2/, diffusion_gemma/: config, model and engine per family, kernels where it has its own;
+                   diffusion_gemma/batched.py: the batched engine
   layers/          Linear (DeepGEMM BF16 / FP8, cuBLAS, a Triton GEMM in cuBLAS's B200 order)
   quantization/    NVFP4 (ModelOpt exports): dequantization, expert layouts for the TRT-LLM-gen, CUTLASS and Triton MoEs
   distributed/     the tensor / expert parallel group and the fused reduction
@@ -160,7 +191,7 @@ dlmrt/
 benchmarks/        scoring, TPF / TPS of suite records, token-identity comparison, kernel sweeps
 examples/          offline inference
 tests/             kernel tests and checkpoint-gated parity tests
-tools/             check_imports.py (the static import check CI runs), architecture_svg.py (the block-graph figure)
+tools/             check_imports.py (the static import check CI runs), architecture_svg.py (the docs' figures)
 ```
 
 ## Citation

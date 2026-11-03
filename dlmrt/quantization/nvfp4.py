@@ -364,6 +364,24 @@ def tune(experts, num_experts, lo, intermediate, rows, hidden, top_k, device, ca
     return Tactics(path, key, [list(t) if isinstance(t, tuple) else t for t in ranked])
 
 
+def keep(tactics):
+    """FlashInfer's autotune(cache=...) keeps only the tactics of the file it loaded last (the latest `tune` or
+    `pin`): add, from the files of `tactics` in order, the entries the loaded configs lack, so that a row count off
+    FlashInfer's token buckets runs its own tuned tactic instead of the fallback (the loaded choice stands where
+    there is one)."""
+    from flashinfer.autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+    loaded = dict(tuner._file_configs)
+    for t in tactics:
+        tuner._file_configs.clear()
+        if Path(t.path).exists() and tuner.load_configs(str(t.path)):
+            for key, value in tuner._file_configs.items():
+                loaded.setdefault(key, value)
+    tuner._file_configs.clear()
+    tuner._file_configs.update(loaded)
+
+
 def pin(tactics, tactic):
     """Make `tactic` the one FlashInfer uses (graphs captured afterwards) and persist it in the cache file."""
     from flashinfer.autotuner import AutoTuner, autotune

@@ -4,7 +4,7 @@ import sys
 
 USAGE = """usage: dlmrt {bench,serve} ...
 
-    bench   latency, smoke, HumanEval, suite and TPS benchmarks (dlmrt bench --help)
+    bench   latency, smoke, HumanEval, suite, TPS and batched throughput benchmarks (dlmrt bench --help)
     serve   streaming HTTP server, one request at a time (dlmrt serve --help)
 """
 

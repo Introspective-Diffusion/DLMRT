@@ -76,6 +76,30 @@ are, HumanEval `prompt` rows as system + instruction + fenced prompt, through th
 the canvas noise for every request. The paper's settings: 4096 new tokens (2048 for HumanEval), seeds 1234-1236
 averaged, each checkpoint's decoder (`--role base` / `--role orl`) on all four benchmarks.
 
+## DiffusionGemma batched throughput
+
+```bash
+python -m dlmrt bench throughput --model DG_CKPT --role orl --problems gsm8k.jsonl [--levels 1 2 4 ...] [--out DIR]
+python -m dlmrt bench identity --model DG_CKPT --role orl [--problems gsm8k.jsonl --count 3] \
+    [--canvas-length 32 --stop-rule freeze_argmax] [--repeats 3 --ignore-eos --max-new-tokens 1024]
+```
+
+`throughput` runs the batched engine ([batched.md](batched.md)) on one GPU in closed loop: at each concurrency N, N
+requests in flight until max(`--count`, 4 × N) requests from the problem file (`--skip` rows in) have finished
+(default 128). It reports aggregate tok/s, the median request tok/s, tokens per denoise round, the time per forward
+and per launch on the host, the time to the first canvas, the canvases per length and the request slots per stage;
+`--phases N1:K1,N2:K2,...` instead runs one level whose concurrency changes after each K requests. Defaults: canvas
+lengths 256 / 128 / 32 by load (`--tiers 2:256,11:128,0:32`; `--tiers 0:32` fixes one), `freeze_argmax` for 32-row
+canvases (`--stops`), commit lanes (`--no-fused`), `--max-batch` the largest level, 4096 new tokens over
+`--max-seq-len 4608` positions per request. `--out` writes `settings.json`, `summary.json` and per level
+`c<N>/requests.jsonl` (text, token ids, denoise steps and canvas lengths per request; `gold` / `meta` copied from the
+problem rows), which `benchmarks/compare_runs.py` compares between two runs.
+
+`identity` runs each prompt through GemmaEngine and through the batched engine with one request slot, on the same
+model, and checks that tokens and denoise steps are identical (exit code 1 otherwise); it also reports the batched
+engine's speed relative to GemmaEngine (`--repeats` keeps each engine's fastest run). `--canvas-length` overrides the
+checkpoint's canvas length for both.
+
 ## QwenDLM suite
 
 ```bash

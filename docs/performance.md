@@ -4,7 +4,8 @@ Unless noted: one request at a time on an otherwise idle node; request TPS = gen
 prefill kernel to the last block (tokenization excluded), pooled over requests; round latency = CUDA-event median of
 one captured denoise round (self-conditioning → forward → LM head → decide) at a fixed context (DiffusionGemma: every
 replay from the same random block and decoder state). Engines are compared on time per forward; models that sample
-noise are compared over multiple seeds.
+noise are compared over multiple seeds. Throughput with many concurrent requests (DiffusionGemma's batched engine, one
+B200): [batched.md](batched.md#measured-on-one-b200).
 
 ## All models, BF16 on one H100
 

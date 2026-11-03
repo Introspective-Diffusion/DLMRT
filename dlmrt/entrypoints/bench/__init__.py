@@ -11,10 +11,16 @@
                                                  the paper's generation protocol over problem files (records for the
                                                  paper's isolated scorers)
     dlmrt bench tps --model LLADA_CKPT           LLaDA2 only: the paper's TPS quick check
+    dlmrt bench throughput --model DG_CKPT --problems gsm8k.jsonl [--levels 1 8 64] [--out DIR]
+                                                 DiffusionGemma only: the batched engine in closed loop at each
+                                                 concurrency (one GPU)
+    dlmrt bench identity --model DG_CKPT [--canvas-length 32 --stop-rule freeze_argmax]
+                                                 DiffusionGemma only: the batched engine's tokens against GemmaEngine's
+                                                 for one request at a time
 
-Tensor parallel: launch any command under `torchrun --nproc-per-node N -m dlmrt bench ...`; every rank runs the same
-program and rank 0 reports (`--numerics sglang` runs on one GPU only). Family-specific options are listed under each
-command's --help.
+Tensor parallel: launch any command but throughput / identity under `torchrun --nproc-per-node N -m dlmrt bench ...`;
+every rank runs the same program and rank 0 reports (`--numerics sglang` runs on one GPU only). Family-specific options
+are listed under each command's --help.
 """
 
 import argparse

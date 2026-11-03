@@ -17,8 +17,9 @@ python -m dlmrt serve --model CKPT --port 18081                       # one GPU
 | `--threshold` | LLaDA2: override the role's acceptance threshold |
 | `--precision` | DiffusionGemma and LLaDA2: `bf16` or `nvfp4` (default: the checkpoint's) |
 
-Rank 0 serves HTTP and broadcasts each request to the other ranks; every rank runs the same generation. dlmrt is a
-single-request engine: one request runs at a time and later ones wait in a queue. Before serving, the server runs a
+Rank 0 serves HTTP and broadcasts each request to the other ranks; every rank runs the same generation. The server
+runs one request at a time and later ones wait in a queue (DiffusionGemma's batched engine, [batched.md](batched.md),
+is not in the server yet). Before serving, the server runs a
 warm-up generation, so every CUDA graph exists when the first request arrives.
 
 The tokenizer is loaded with `trust_remote_code=True`, as in the Python API, so a checkpoint's own Python code runs
