@@ -21,6 +21,9 @@ The host launches one CUDA graph per block and reads back its token ids. The den
 WHILE node (`dlmrt/ops/csrc/block_graph.cu`) whose condition kernel reads device counters after every round, so no
 round waits for the CPU. `LoopGraph` chains several WHILE loops (LLaDA2's fused rounds use two). DiffusionGemma
 commits each canvas at the start of the next canvas's graph, so a request's last canvas is never committed.
+DiffusionGemma's batched engine runs many requests through one `StagedLoopGraph`: a WHILE loop whose body is a fixed
+sequence of stages, some under IF nodes, that serves every request from its prompt to its last canvas
+([batched.md](batched.md#how-it-works)).
 
 Every kernel in a round is a programmatic dependent launch (PDL): each waits for its predecessor before touching
 memory and releases its successor near its end (~0.4 µs saved per kernel boundary): Triton kernels after their last
@@ -36,6 +39,7 @@ that do work; an early release makes the next GEMM's CTAs land out of order.
 | `dlmrt/models/<family>/model.py` | weights (sharded under TP), the KV cache, the block forward |
 | `dlmrt/models/<family>/engine.py` | request state, graph capture, the host loop over blocks |
 | `dlmrt/models/{llada2,diffusion_gemma}/kernels.py` | Triton kernels particular to the family |
+| `dlmrt/models/diffusion_gemma/batched.py` | `BatchedGemmaEngine`: many DiffusionGemma requests per forward (one GPU), per-request stages and canvas lengths, the load policy, commit lanes, the host loop |
 | `dlmrt/models/diffusion_gemma/{attention,experts,precision}.py` | DiffusionGemma's attention (FA3, Triton) and routed-expert (DeepGEMM, TRT-LLM-gen, CUTLASS) backends, its checkpoint reading per precision |
 | `dlmrt/models/{llada2,sdar}/sglang_numerics.py`, `sglang_kernels.py` | the SGLang-numerics modes: the paper runtime's forward and decisions in dlmrt's block graphs, and the kernels that reproduce its reductions bit for bit |
 | `dlmrt/ops/triton/` | shared Triton kernels: PDL plumbing and numerics helpers (`common`), norms / SwiGLU / FP8 quantization / Q/K-RoPE / embedding (`core`), the QwenDLM and LLaDA2 decoder (`decoding`), MoE routing and the masked expert layout (`moe`), flash attention where FA3 does not run (`attention`), on SM 12.x the NVFP4 MoE with the TRT-LLM-gen MoE's roundings (`nvfp4_moe`), BF16 GEMMs in cuBLAS's B200 summation order (`gemm`) and a Gluon attention in the B200 kernel's summation order (`b200_attention`), for the SGLang-numerics modes SGLang's fused MoE (`sglang_fused_moe`, vendored) and QK norm + RoPE (`sglang_rope`) |

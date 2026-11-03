@@ -111,7 +111,8 @@ uniform-state block diffusion on a Gemma 4 mixture-of-experts backbone. The ORL 
   cap; `GemmaDecode(stop_rule="freeze")` keeps every accepted sample for the rest of the canvas and stops once every
   position is accepted, `"freeze_argmax"` keeps the accepted position's argmax token instead (on the ORL checkpoint,
   first 400 GSM8K problems, one seed: 91% accuracy at 32-row canvases with 10 tokens per round, against 92% and 29 at
-  256 rows under the reference rule).
+  256 rows under the reference rule). The batched engine ([batched.md](batched.md)) runs 32-row canvases with
+  `freeze_argmax`.
 - **Prompts**: the tokenizer's chat template; `thinking=False` passes `enable_thinking=False` (the answer then opens
   with an empty thought channel, which the API hides).
 - **Precision** (`precision`): `bf16`, or `nvfp4` for ModelOpt NVFP4 exports: W4A4 experts (E2M1 weights with an FP8

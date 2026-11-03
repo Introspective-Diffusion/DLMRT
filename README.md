@@ -5,7 +5,7 @@
   <img alt="dlmrt" src="assets/dlmrt-logo-light.svg" width="400">
 </picture>
 
-**A single-request inference engine for block-diffusion language models**
+**An inference engine for block-diffusion language models: fast single requests and batched serving**
 
 [Paper](https://arxiv.org/abs/2610.20687) · [Project page](https://introspective-diffusion.github.io/orl-dlm) · [ORL code](https://github.com/Introspective-Diffusion/ORL) ·
 [Checkpoints](https://huggingface.co/collections/yifanyu/orl-on-policy-residual-learning-for-diffusion-lms)
@@ -15,11 +15,14 @@
 
 </div>
 
-dlmrt runs one request at a time and makes that request fast. Every forward denoises a whole block of tokens, and the
-denoising loop runs on the GPU. It serves QwenDLM, LLaDA2.1-mini and DiffusionGemma checkpoints on one GPU or tensor
+dlmrt makes a single request fast and, for DiffusionGemma, batches many requests into each forward. Every forward
+denoises whole blocks of tokens, and the denoising loop runs on the GPU. It serves QwenDLM, LLaDA2.1-mini and DiffusionGemma checkpoints on one GPU or tensor
 parallel across an NVLink node, on NVIDIA Hopper (H100) and, for LLaDA2.1-mini and DiffusionGemma, Blackwell (B200,
 B300; NVFP4 also on the RTX 5090). It is the inference engine of
 [On-Policy Residual Learning for Diffusion Language Models](https://arxiv.org/abs/2610.20687) (ORL).
+
+The DiffusionGemma batched engine runs on one GPU: many requests per forward, each at its own stage and with a canvas
+length chosen from the load ([docs/batched.md](docs/batched.md)).
 
 ## Highlights
 
@@ -37,6 +40,12 @@ B300; NVFP4 also on the RTX 5090). It is the inference engine of
   and DiffusionGemma (FlashInfer's TRT-LLM-gen MoE; on RTX 50-series GPUs dlmrt's Triton MoE with the TRT-LLM-gen
   MoE's roundings for LLaDA2, bitwise the B200's in all but about 0.2% of rows, and FlashInfer's CUTLASS MoE for
   DiffusionGemma), with an FP8 KV cache.
+- **Batched DiffusionGemma.** Requests share forwards in ragged rows, each in its own stage (prompt chunk, canvas
+  round, commit) switched on the GPU; canvases of 256, 128 or 32 rows by load, with commits fused into the next
+  canvas's first round. On one B200 (GSM8K prompts, closed loop) it reaches 23.7K tok/s at 128 concurrent requests,
+  1.1–3.8× vLLM's DFlash speculative decoding from 1 to 128 requests
+  ([measurements and caveats](docs/batched.md#measured-on-one-b200)), and emits GemmaEngine's tokens for a request that
+  runs alone.
 
 ## Supported models
 
@@ -123,6 +132,8 @@ python -m dlmrt bench step --model CKPT    # round latency at fixed contexts
 torchrun --nproc-per-node 8 -m dlmrt bench humaneval --model CKPT --inputs openai_humaneval.parquet \
     --out results/he --full --repeats 1 --max-new-tokens 2048 [--role orl]
 python benchmarks/humaneval_score.py openai_humaneval.parquet results/he   # runs model-written code: use a sandbox
+# DiffusionGemma, batched engine on one GPU: closed loop at 1-128 concurrent requests
+python -m dlmrt bench throughput --model DG_CKPT --role orl --problems gsm8k.jsonl --out results/throughput
 ```
 
 ## Reproducing the papers
@@ -137,6 +148,7 @@ the results table, the settings and the scoring are in
 | --- | --- |
 | [Architecture](docs/architecture.md) | the block graph, the device loop, kernels, tensor parallelism |
 | [Models](docs/models.md) | the three families, their decoders, precisions and options |
+| [Batched DiffusionGemma](docs/batched.md) | the batched engine: running it, how it works, B200 throughput |
 | [Performance](docs/performance.md) | latency, throughput and accuracy |
 | [Benchmarks](docs/benchmarks.md) | benchmark protocols and reproducing the papers |
 | [Server](docs/server.md) | `dlmrt serve` and its HTTP API |
