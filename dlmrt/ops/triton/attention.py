@@ -48,7 +48,11 @@ def _attention(Q, K, V, O, PO, PL, START, END, LEFT, scale, HQ: tl.constexpr, HK
         chunk = tl.cdiv(tl.cdiv(stop - first, SPLITS), BLOCK_N) * BLOCK_N
         lo = first + split * chunk
         hi = tl.minimum(stop, lo + chunk)
-    m_i = tl.full((BLOCK_M,), float("-inf"), tl.float32)
+    # Without key splits the running max starts finite: a causal row past the sliding window can see none of the
+    # first key tile (its range starts at the window of the query tile's first row), and exp(-inf - -inf) is NaN.
+    m_i = tl.full((BLOCK_M,), -1.0e30, tl.float32)
+    if SPLITS > 1:
+        m_i = tl.full((BLOCK_M,), float("-inf"), tl.float32)
     l_i = tl.zeros((BLOCK_M,), tl.float32)
     acc = tl.zeros((BLOCK_M, DV), tl.float32)
     for n0 in range(lo, hi, BLOCK_N):

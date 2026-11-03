@@ -134,6 +134,36 @@ def test_attention_sliding(causal, start, fp8):
     assert rel(out[0], ref) < 5e-3
 
 
+def sliding_reference(q, k, v, start, window):
+    """FP32 causal sliding-window attention of q [1, rows, HQ, D] at positions [start, start + rows)."""
+    rows, hq, hk = q.shape[1], q.shape[2], k.shape[2]
+    end = start + rows
+    kk = k[0, :end].float().repeat_interleave(hq // hk, 1)
+    vv = v[0, :end].float().repeat_interleave(hq // hk, 1)
+    kpos, qpos = torch.arange(end, device=dev)[None, :], torch.arange(start, end, device=dev)[:, None]
+    keep = (kpos <= qpos) & (kpos > qpos - window)
+    scores = torch.einsum("qhd,khd->hqk", q[0].float(), kk).masked_fill(~keep[None], float("-inf"))
+    return torch.einsum("hqk,khd->qhd", scores.softmax(-1), vv)
+
+
+@pytest.mark.parametrize("block_m", [64, 128])
+def test_attention_one_split_window(block_m):
+    """One key split (programs=1): a query tile's key range starts at its first row's window, so its later rows can
+    see none of the first key tile; every row stays finite at every phase of the window against the key tiles."""
+    from dlmrt.ops.triton.attention import attention
+
+    hq, hk, d, window, rows, cap = 16, 8, 256, 1024, 64, 2048
+    k = torch.randn(1, cap, hk, d, device=dev).to(torch.bfloat16)
+    v = torch.randn(1, cap, hk, d, device=dev).to(torch.bfloat16)
+    q = (torch.randn(1, rows, hq, d, device=dev) * 0.2).to(torch.bfloat16)
+    for start in range(window, window + 64, 3):
+        s = torch.tensor([start], device=dev, dtype=torch.int32)
+        out = attention(q, k, v, s, s + rows, True, window=window, block_m=block_m, block_n=64, num_warps=4,
+                        programs=1)
+        assert bool(torch.isfinite(out).all()), start
+        assert rel(out[0], sliding_reference(q, k, v, start, window)) < 5e-3, start
+
+
 @pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize("sliding", [True, False])
 def test_qkv_norm_rope(sliding, split):
