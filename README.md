@@ -146,9 +146,9 @@ the results table, the settings and the scoring are in
 
 | | |
 | --- | --- |
-| [Architecture](docs/architecture.md) | the block graph, the device loop, kernels, tensor parallelism |
+| [Architecture](docs/architecture.md) | the block graph, the device loop, the batched launch graph, kernels, tensor parallelism |
 | [Models](docs/models.md) | the three families, their decoders, precisions and options |
-| [Batched DiffusionGemma](docs/batched.md) | the batched engine: running it, how it works, B200 throughput |
+| [Batched DiffusionGemma](docs/batched.md) | the batched engine: running it, per-request stages, scheduling, B200 throughput |
 | [Performance](docs/performance.md) | latency, throughput and accuracy |
 | [Benchmarks](docs/benchmarks.md) | benchmark protocols and reproducing the papers |
 | [Server](docs/server.md) | `dlmrt serve` and its HTTP API |
@@ -160,7 +160,8 @@ the results table, the settings and the scoring are in
 ```
 dlmrt/
   llm.py           LLM: the Python API (also used by the server)
-  models/          sdar/, llada2/, diffusion_gemma/: config, model and engine per family, kernels where it has its own
+  models/          sdar/, llada2/, diffusion_gemma/: config, model and engine per family, kernels where it has its own;
+                   diffusion_gemma/batched.py: the batched engine
   layers/          Linear (DeepGEMM BF16 / FP8, cuBLAS, a Triton GEMM in cuBLAS's B200 order)
   quantization/    NVFP4 (ModelOpt exports): dequantization, expert layouts for the TRT-LLM-gen, CUTLASS and Triton MoEs
   distributed/     the tensor / expert parallel group and the fused reduction
@@ -172,7 +173,7 @@ dlmrt/
 benchmarks/        scoring, TPF / TPS of suite records, token-identity comparison, kernel sweeps
 examples/          offline inference
 tests/             kernel tests and checkpoint-gated parity tests
-tools/             check_imports.py (the static import check CI runs), architecture_svg.py (the block-graph figure)
+tools/             check_imports.py (the static import check CI runs), architecture_svg.py (the docs' figures)
 ```
 
 ## Citation

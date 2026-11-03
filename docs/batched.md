@@ -62,18 +62,50 @@ configuration `dlmrt bench throughput` runs, and the one measured below, is:
 
 ## How it works
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/batched-launch-dark.svg">
+  <img alt="One launch of the batched engine. On the host, between launches: launch the graph for the row count; no
+  host step until a request finishes or parks; then collect the finished requests, pick the canvas length from the
+  load (256, 128 or 32), admit waiting requests within max_rows, lay out the rows, size the commit lanes and launch
+  again. On the device: admit (a new request takes its first prompt rows, a parked one a canvas of its new length),
+  then a WHILE loop, run while some request runs and none has finished or parked since the launch, of the forward over
+  all rows, the LM head and decoder (if a canvas round), advance and claim, and self-conditioning (if a round past 0
+  follows). One forward's rows: each request owns a contiguous range (a canvas round, a commit or prompt rows), then
+  padding and commit lanes. The loop exits when a request finishes or parks." src="../assets/batched-launch-light.svg"
+  width="100%">
+</picture>
+
+One launch serves every request in the batch until one of them finishes or parks:
+
 ```
 one launch = admit -> WHILE(some request runs and none has finished or parked since the launch){
                  embed + forward -> [LM head + decoder] -> advance [-> claim] -> [self-conditioning]}
 ```
 
-- **Stages per request.** Each request's stage lives at its KV slot: PREFILL (its next prompt rows, causal), DENOISE
-  (a round of its canvas, bidirectional over the canvas), COMMIT (the stopped canvas's causal re-encode), SWITCH
-  (parked between two canvases until it has rows of another length), DONE / IDLE. After each forward, `advance`
-  moves every request on by itself: a stopped canvas is recorded and committed in the next forward unless it ends the
-  request (an EOS within the budget, or the last canvas, which GemmaEngine does not commit either); a commit or the
-  prompt's last chunk begins the next canvas. No canvas waits for another, and prompts are prefilled inside the
-  shared forwards.
+Inside a launch the GPU moves every request on after each forward. The host steps in between launches only, to
+collect finished requests, admit new ones and change canvas lengths: 0.4–1.0 ms per launch in the runs below.
+
+### Stages per request
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/batched-stages-dark.svg">
+  <img alt="A request's stages. Admitted, it runs PREFILL (prompt rows, causal) for its next prompt rows until the
+  prompt is done, then DENOISE (canvas rounds, bidirectional) until the canvas stops. A stopped canvas goes to DONE
+  if it has an EOS within the budget or is the last canvas (never committed); takes a free commit lane and starts the
+  next canvas in the same forward; or goes to COMMIT. After COMMIT the next canvas starts if its length is unchanged;
+  otherwise the request parks in SWITCH until the host gives it rows of the new length. DONE and SWITCH end the
+  launch." src="../assets/batched-stages-light.svg" width="100%">
+</picture>
+
+Each request's stage lives at its KV slot: PREFILL (its next prompt rows, causal), DENOISE (a round of its canvas,
+bidirectional over the canvas), COMMIT (the stopped canvas's causal re-encode), SWITCH (parked between two canvases
+until it has rows of another length), DONE / IDLE. After each forward, `advance` moves every request on by itself: a
+stopped canvas is recorded and committed in the next forward unless it ends the request (an EOS within the budget, or
+the last canvas, which GemmaEngine does not commit either); a commit or the prompt's last chunk begins the next
+canvas. No canvas waits for another, and prompts are prefilled inside the shared forwards.
+
+### Rows and the launch graph
+
 - **Ragged rows.** Request p owns a contiguous range of B_p rows, B_p one of up to four canvas lengths. Row kernels
   (embed, Q/K-norm + RoPE, logit statistics, the SC softmax) read a per-row (slot, index) map; an attention query
   tile reads it at its first row, every request's rows being aligned to the launch's alignment. The per-request
@@ -85,19 +117,44 @@ one launch = admit -> WHILE(some request runs and none has finished or parked si
   round, the self-conditioning when the next forward has one past its round 0. One graph per row bucket, all built
   at start; the buckets follow FlashInfer's MoE token buckets, so every forward's row count runs its own tuned expert
   tactic.
-- **Canvas lengths follow the load.** Before each launch the host asks the policy for the canvas length of a batch
-  of n requests. A request keeps its rows until its current canvas is committed; if it then wants another length it
-  parks, which ends the launch, and the host gives it rows of the new length (committed context is ordinary causal
-  KV, so nothing moves but its rows).
-- **Commit lanes.** A launch holds lanes of its canvas length after the requests' rows, as many as the claims it
-  expects per forward make cheapest (claim rates measured over the run). A stopped canvas takes a lane in
-  request-position order: its tokens are copied to the lane, mapped to its slot just before the next canvas, and its
-  next canvas begins at once; the commit runs in the same forward as that canvas's first round, whose attention reads
-  the lane's K/V written earlier in each layer. One that finds no lane commits in its own rows.
-- **The host.** When a request finishes or parks, the host reads its canvases back (one copy per launch), admits
-  waiting requests within the row budget `max_rows`, compacts the batch, moves the rows a request carries between
-  forwards (tokens, canvas, accepted mask, SC delta) when its first row changed, and relaunches: 0.4–1.0 ms per
-  launch in the runs below.
+
+### Scheduling
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/batched-schedule-dark.svg">
+  <img alt="An example schedule over 24 forwards. Requests A, B and C run 128-row canvases in launch 1. C finishes
+  and the host admits D, whose prompt rows run in the first forward of launch 2. A finishes at the end of launch 2;
+  128 rows stay for two requests. D finishes at the end of launch 3 and the policy picks 256 rows for one request: B
+  finishes its 128-row canvas and commits it in launch 4, parks, and runs 256-row canvases from launch 5."
+  src="../assets/batched-schedule-light.svg" width="100%">
+</picture>
+
+When a launch ends, the host:
+
+1. reads back every request's stage and the finished requests' canvases (one copy each);
+2. asks the policy for the canvas length of a batch of n requests (the concurrency limit, or the requests left when
+   fewer) and sets it as every request's wanted length. `LoadPolicy()` gives 256 up to 2 requests, 128 up to 11, then
+   32, and keeps the current length while n is within one request of its range;
+3. gives each parked request rows of the length it wants, within the row budget `max_rows`;
+4. admits waiting requests into the freed batch positions, then after the last one, while the concurrency limit and
+   `max_rows` allow; a new request gets rows of the wanted length (or a prompt chunk, with `prefill`);
+5. moves the last requests into the gaps, lays out the rows, and moves the rows a request carries between forwards
+   (tokens, canvas, accepted mask, SC delta) when its first row changed;
+6. with commit lanes, picks how many lanes the launch holds (below), and relaunches the loop built for the row count.
+
+A request keeps its rows until its current canvas is committed: a new wanted length takes effect at its next canvas,
+when the request parks (which ends the launch) and the host gives it rows of that length. Committed context is
+ordinary causal KV at the request's slot, so nothing moves but its rows. In the example, B finishes the 128-row canvas
+it is in after ③, commits it and parks; from ④ it runs 256-row canvases.
+
+### Commit lanes
+
+From 8 requests on, at canvas lengths up to 64, a launch holds lanes of its canvas length after the requests' rows, as
+many as the claims it expects per forward make cheapest: the claim rates are measured over the run and the claims per
+forward taken as Poisson; a lane costs its rows, a canvas that finds none its request's share of a forward. A stopped
+canvas takes a lane in request-position order: its tokens are copied to the lane, mapped to its slot just before the
+next canvas, and its next canvas begins at once; the commit runs in the same forward as that canvas's first round,
+whose attention reads the lane's K/V written earlier in each layer. One that finds no lane commits in its own rows.
 
 ## Measured on one B200
 

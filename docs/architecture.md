@@ -1,6 +1,7 @@
 # Architecture
 
-dlmrt serves one request at a time and optimizes that request's tokens per second. Block-diffusion models generate
+dlmrt optimizes a single request's tokens per second and, for DiffusionGemma, also serves many requests per forward on
+one GPU ([the batched launch graph](#the-batched-launch-graph)). Block-diffusion models generate
 a block of tokens (32 or 256) at a time: a block starts as noise and is refined by several bidirectional forward
 passes ("denoise rounds") over the whole block until the decoder accepts every position; a causal "commit" pass then
 writes the block's keys and values for the blocks after it.
@@ -21,15 +22,35 @@ The host launches one CUDA graph per block and reads back its token ids. The den
 WHILE node (`dlmrt/ops/csrc/block_graph.cu`) whose condition kernel reads device counters after every round, so no
 round waits for the CPU. `LoopGraph` chains several WHILE loops (LLaDA2's fused rounds use two). DiffusionGemma
 commits each canvas at the start of the next canvas's graph, so a request's last canvas is never committed.
-DiffusionGemma's batched engine runs many requests through one `StagedLoopGraph`: a WHILE loop whose body is a fixed
-sequence of stages, some under IF nodes, that serves every request from its prompt to its last canvas
-([batched.md](batched.md#how-it-works)).
 
 Every kernel in a round is a programmatic dependent launch (PDL): each waits for its predecessor before touching
 memory and releases its successor near its end (~0.4 µs saved per kernel boundary): Triton kernels after their last
 store, the patched DeepGEMM GEMM and the post-attention megakernel after their mainloop, since their successors are
 row kernels that wait anyway. A kernel followed by a GEMM must release only after its last store, and from threads
 that do work; an early release makes the next GEMM's CTAs land out of order.
+
+## The batched launch graph
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/batched-launch-dark.svg">
+  <img alt="One launch of DiffusionGemma's batched engine. On the host, between launches: launch the graph for the row
+  count; no host step until a request finishes or parks; then collect the finished requests, pick the canvas length
+  from the load, admit waiting requests within max_rows, lay out the rows, size the commit lanes and launch again. On
+  the device: admit, then a WHILE loop of the forward over all rows, the LM head and decoder (if a canvas round),
+  advance and claim, and self-conditioning (if a round past 0 follows), run while some request runs and none has
+  finished or parked since the launch. Each request owns a contiguous range of the forward's rows (a canvas round, a
+  commit or prompt rows), followed by padding and commit lanes." src="../assets/batched-launch-light.svg"
+  width="100%">
+</picture>
+
+DiffusionGemma's batched engine (`dlmrt/models/diffusion_gemma/batched.py`, one GPU) runs many requests through one
+`StagedLoopGraph`: the block graph's WHILE loop with a fixed body (forward, LM head and decoder, advance,
+self-conditioning), the decoder and the self-conditioning under IF nodes, after an admit stage. Every request owns a
+contiguous range of each forward's rows and keeps its stage (prompt rows, a canvas round, a commit) at its KV slot;
+after each forward `advance` moves every request on by itself, and the loop exits when a request finishes or parks
+for a canvas of another length. Between launches the host collects finished requests, picks the canvas length from
+the load, admits waiting requests, lays out the rows and relaunches. The stages, the scheduling and the measurements:
+[batched.md](batched.md#how-it-works).
 
 ## Code map
 

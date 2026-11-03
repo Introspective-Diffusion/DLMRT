@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 440" width="1000" height="440" role="img" aria-label="dlmrt batched engine: a request's stages"><title>dlmrt batched engine: a request's stages</title><defs><marker id="head-line" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#6E7681"/></marker><marker id="head-accent" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3FB950"/></marker><marker id="head-lane" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#AB7DF8"/></marker></defs>
+<text x="24" y="40" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="700" fill="#9198A1" text-anchor="start" letter-spacing="1.2">PER REQUEST</text>
+<text x="130" y="40" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9198A1" text-anchor="start">the stage lives at the request's KV slot; after every forward each request moves on by itself</text>
+<rect x="14" y="164" width="84" height="28" rx="14" fill="#151B23" stroke="#3D444D" stroke-width="1.2" stroke-dasharray="4 4"/>
+<text x="56" y="182" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9198A1" text-anchor="middle">admitted</text>
+<rect x="126" y="150" width="200" height="56" rx="10" fill="#0D2645" stroke="#4493F8" stroke-width="1.4"/>
+<text x="142" y="174" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700" fill="#E6EDF3" text-anchor="start">PREFILL</text>
+<text x="142" y="193" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="start">prompt rows, causal</text>
+<rect x="425" y="150" width="200" height="56" rx="10" fill="#12301C" stroke="#3FB950" stroke-width="1.4"/>
+<text x="441" y="174" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700" fill="#E6EDF3" text-anchor="start">DENOISE</text>
+<text x="441" y="193" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="start">canvas round, bidirectional</text>
+<rect x="735" y="150" width="200" height="56" rx="10" fill="#3A2212" stroke="#DB6D28" stroke-width="1.4"/>
+<text x="751" y="174" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700" fill="#E6EDF3" text-anchor="start">COMMIT</text>
+<text x="751" y="193" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="start">canvas re-encoded, causal</text>
+<rect x="425" y="330" width="200" height="56" rx="10" fill="#151B23" stroke="#3D444D" stroke-width="1.4"/>
+<text x="441" y="354" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700" fill="#E6EDF3" text-anchor="start">DONE</text>
+<text x="441" y="373" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="start">ends the launch; read back</text>
+<rect x="735" y="330" width="200" height="56" rx="10" fill="#33270A" stroke="#D29922" stroke-width="1.4"/>
+<text x="751" y="354" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700" fill="#E6EDF3" text-anchor="start">SWITCH</text>
+<text x="751" y="373" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="start">parked; ends the launch</text>
+<path d="M 100 178 L 124 178" fill="none" stroke="#6E7681" stroke-width="1.6" stroke-linejoin="round" stroke-dasharray="4 4" marker-end="url(#head-line)"/>
+<path d="M 196 150 C 196 112, 256 112, 256 148" fill="none" stroke="#3FB950" stroke-width="1.6" marker-end="url(#head-accent)"/>
+<text x="226" y="108" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="middle">next prompt rows</text>
+<path d="M 328 178 L 423 178" fill="none" stroke="#3FB950" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#head-accent)"/>
+<text x="376" y="170" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="middle">prompt done</text>
+<path d="M 465 150 C 465 108, 515 108, 515 148" fill="none" stroke="#3FB950" stroke-width="1.6" marker-end="url(#head-accent)"/>
+<text x="457" y="116" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="end">not stopped:</text>
+<text x="457" y="131" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="end">next round</text>
+<path d="M 565 150 C 565 108, 612 108, 612 148" fill="none" stroke="#AB7DF8" stroke-width="1.6" marker-end="url(#head-lane)"/>
+<text x="626" y="108" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#AB7DF8" text-anchor="start">stopped, a commit lane free:</text>
+<text x="626" y="123" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#AB7DF8" text-anchor="start">commit in the lane while the next</text>
+<text x="626" y="138" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#AB7DF8" text-anchor="start">canvas starts, in one forward</text>
+<path d="M 627 170 L 733 170" fill="none" stroke="#3FB950" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#head-accent)"/>
+<text x="680" y="162" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="middle">stopped</text>
+<path d="M 733 192 L 627 192" fill="none" stroke="#3FB950" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#head-accent)"/>
+<text x="680" y="210" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="middle">next canvas,</text>
+<text x="680" y="224" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="middle">same length</text>
+<path d="M 525 208 L 525 328" fill="none" stroke="#3FB950" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#head-accent)"/>
+<text x="515" y="252" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="end">stopped with an EOS within</text>
+<text x="515" y="267" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="end">its budget, or its last canvas:</text>
+<text x="515" y="282" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="end">never committed</text>
+<path d="M 835 208 L 835 328" fill="none" stroke="#3FB950" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#head-accent)"/>
+<text x="845" y="252" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="start">next canvas wants</text>
+<text x="845" y="267" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="start">another length:</text>
+<text x="845" y="282" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="start">park</text>
+<path d="M 733 358 L 660 358 L 660 240 L 590 240 L 590 210" fill="none" stroke="#6E7681" stroke-width="1.6" stroke-linejoin="round" stroke-dasharray="4 4" marker-end="url(#head-line)"/>
+<text x="668" y="300" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="start">host: rows of</text>
+<text x="668" y="315" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#9198A1" text-anchor="start">the new length</text>
+<path d="M 24 416 L 64 416" fill="none" stroke="#3FB950" stroke-width="1.6" stroke-linejoin="round" marker-end="url(#head-accent)"/>
+<text x="74" y="420" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9198A1" text-anchor="start">after a forward, on the GPU (advance, claim)</text>
+<path d="M 380 416 L 420 416" fill="none" stroke="#6E7681" stroke-width="1.6" stroke-linejoin="round" stroke-dasharray="4 4" marker-end="url(#head-line)"/>
+<text x="430" y="420" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#9198A1" text-anchor="start">between launches, by the host</text>
+</svg>
