@@ -263,6 +263,34 @@ def test_logit_stats_and_decide(rand4):
     assert int(remaining) == 0  # argmax unchanged and confident
 
 
+def test_decide_nan_rows():
+    """Rows of NaN logits (logit_stats finds no argmax / sample) are re-noised and counted; no token leaves the
+    vocabulary."""
+    from dlmrt.models.diffusion_gemma import kernels as gk
+    from dlmrt.models.diffusion_gemma import GemmaDecode
+
+    v, cap, d = 262144, 30.0, GemmaDecode()
+    logits = (torch.randn(T, v, device=dev) * 3).to(torch.bfloat16)
+    logits[:T // 4, 7] = 60.0
+    nan = torch.zeros(T, dtype=torch.bool, device=dev)
+    nan[T // 8:T // 2:3] = True
+    logits[nan] = float("nan")
+    i32 = {"device": dev, "dtype": torch.int32}
+    step, seed, block = torch.tensor([5], **i32), torch.tensor([1234], **i32), torch.tensor([2], **i32)
+    stats = torch.zeros(T, 2, device=dev)
+    argmax, sample = torch.zeros(T, device=dev, dtype=torch.int64), torch.zeros(T, device=dev, dtype=torch.int64)
+    gk.logit_stats(logits, step, seed, block, d, stats, argmax, sample, cap)
+    assert bool((argmax[nan] >= v).all()) and bool((argmax[~nan] < v).all())
+    tokens, canvas = torch.zeros(T, device=dev, dtype=torch.int64), torch.full((T,), -1, device=dev, dtype=torch.int64)
+    remaining, bad = torch.tensor([1], **i32), torch.zeros(1, **i32)
+    accepted = torch.zeros(T, device=dev, dtype=torch.int8)
+    gk.decide(stats, argmax, sample, tokens, canvas, accepted, step, remaining, seed, block, d, v, bad=bad)
+    assert int(bad) == int(nan.sum())
+    assert bool(((tokens >= 0) & (tokens < v)).all()) and bool(((canvas >= 0) & (canvas < v)).all())
+    assert not bool(accepted[nan].any())
+    assert bool((tokens[~nan & (sample == 7)] == 7).all())
+
+
 def test_adaptive_temperature():
     """Three rounds against a transcription of the paper's vLLM adaptive-scalar controller."""
     from dlmrt.models.diffusion_gemma import kernels as gk

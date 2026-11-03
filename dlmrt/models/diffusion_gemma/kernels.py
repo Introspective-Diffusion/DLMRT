@@ -482,32 +482,45 @@ def begin(params, tokens, out, accepted, start, end, leftpad, step, remaining, s
 
 
 @triton.jit
-def _decide(STATS, ARGMAX, SAMPLE, TOKENS, OUT, ACCEPTED, STEP, REMAINING, SEED, BLOCK, bound, confidence,
-            VOCAB: tl.constexpr, B: tl.constexpr, ADAPTIVE: tl.constexpr):
+def _decide(STATS, ARGMAX, SAMPLE, TOKENS, OUT, ACCEPTED, STEP, REMAINING, SEED, BLOCK, BAD, bound, confidence,
+            VOCAB: tl.constexpr, B: tl.constexpr, ADAPTIVE: tl.constexpr, HAS_BAD: tl.constexpr = False):
+    """A position whose logits row had no argmax / sample (logit_stats' 2147483647 for a row of NaN) is never taken:
+    it is re-noised, and its argmax-canvas entry is that noise (no token outside the vocabulary leaves the decoder).
+    HAS_BAD: *BAD += those positions."""
     _wait()
     i = tl.arange(0, B)
     step = tl.load(STEP)
     entropy = tl.load(STATS + i * 2 + 1)
+    rkey = _key(tl.load(SEED), tl.load(BLOCK), step)
     # Nonnegative float bits sort numerically; the index breaks ties deterministically.
     key = (entropy.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | i.to(tl.uint64)
     order = (tl.sort(key, descending=False) & 0xFFFFFFFF).to(tl.int32)
     h = tl.gather(entropy, order, 0)
-    take = (tl.cumsum(h, 0) - h) <= bound
-    noise = tl.randint(_key(tl.load(SEED), tl.load(BLOCK), step), RENOISE_STREAM + order) % VOCAB
-    tl.store(TOKENS + order, tl.where(take, tl.load(SAMPLE + order), noise.to(tl.int64)))
+    sample = tl.load(SAMPLE + order)
+    take = ((tl.cumsum(h, 0) - h) <= bound) & (sample >= 0) & (sample < VOCAB)
+    noise = tl.randint(rkey, RENOISE_STREAM + order) % VOCAB
+    tl.store(TOKENS + order, tl.where(take, sample, noise.to(tl.int64)))
     if ADAPTIVE:  # the next round's temperature averages over the positions not accepted here
         tl.store(ACCEPTED + order, take.to(tl.int8))
     argmax = tl.load(ARGMAX + i)
+    bad = (argmax < 0) | (argmax >= VOCAB)
+    argmax = tl.where(bad, (tl.randint(rkey, RENOISE_STREAM + i) % VOCAB).to(tl.int64), argmax)
     stable = (step > 0) & (tl.sum((argmax != tl.load(OUT + i)).to(tl.int32), 0) == 0)
     confident = tl.sum(entropy, 0) / B < confidence
     tl.store(OUT + i, argmax)
     tl.store(REMAINING, tl.where(stable & confident, 0, 1))
     tl.store(STEP, step + 1)
+    if HAS_BAD:
+        missing = tl.sum(bad.to(tl.int32), 0)
+        if missing > 0:
+            tl.atomic_add(BAD, missing)
     _release()
 
 
-def decide(stats, argmax, sample, tokens, out, accepted, step, remaining, seed, block, config, vocab):
+def decide(stats, argmax, sample, tokens, out, accepted, step, remaining, seed, block, config, vocab, bad=None):
     """Keep samples at the lowest-entropy positions within the entropy bound, re-noise the rest; stop once the
-    argmax canvas is unchanged and the mean entropy is below the confidence threshold."""
-    _decide[(1,)](stats, argmax, sample, tokens, out, accepted, step, remaining, seed, block, config.entropy_bound,
-                  config.confidence_threshold, vocab, tokens.numel(), config.adaptive, num_warps=4, **LAUNCH)
+    argmax canvas is unchanged and the mean entropy is below the confidence threshold. A position whose logits are
+    NaN is re-noised; `bad` (int32, one element) counts them."""
+    _decide[(1,)](stats, argmax, sample, tokens, out, accepted, step, remaining, seed, block,
+                  bad if bad is not None else step, config.entropy_bound, config.confidence_threshold, vocab,
+                  tokens.numel(), config.adaptive, bad is not None, num_warps=4, **LAUNCH)
