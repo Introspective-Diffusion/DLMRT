@@ -78,6 +78,21 @@ on one B200, DiffusionGemma averages seeds 1234–1236. The round latencies and 
 (DiffusionGemma at seed 1234), which reach 1658 (QwenDLM), 2060 (LLaDA2) and 1388 (DiffusionGemma) request TPS at TP=1
 on H100. Methodology and every measurement: [docs/performance.md](docs/performance.md).
 
+### Batched serving
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/throughput-b200-dark.svg">
+  <img alt="Throughput on one B200 at 1, 2, 4, 8, 16 and 32 requests in flight: dlmrt's batched DiffusionGemma 4.3K,
+  5.8K, 8.1K, 10.2K, 14.6K and 17.5K tok/s; vLLM with DFlash 1.1K, 2.1K, 3.6K, 6.5K, 9.3K and 13.9K; vLLM
+  autoregressive 0.3K, 0.7K, 1.2K, 2.1K, 3.7K and 5.9K. dlmrt is 3.8, 2.8, 2.2, 1.6, 1.6 and 1.25 times DFlash."
+  src="assets/throughput-b200-light.svg" width="100%">
+</picture>
+
+DiffusionGemma + ORL through the batched engine on one B200, against Gemma 4 26B-A4B in vLLM 0.31 on the same
+prompts, autoregressive and with a DFlash drafter at its best draft length per concurrency: aggregate output tok/s in
+closed loop, mean of three runs. At 64 and 128 requests dlmrt reaches 21.2K and 23.7K tok/s (1.12× and 1.18× DFlash).
+Every measurement, the GSM8K accuracy per level and the caveats: [docs/batched.md](docs/batched.md#measured-on-one-b200).
+
 ## Installation
 
 dlmrt runs on Linux with Python 3.10+ and compiles its CUDA extensions on first use. It needs PyTorch 2.11, Triton 3.6

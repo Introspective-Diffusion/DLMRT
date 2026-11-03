@@ -176,7 +176,7 @@ and 4 × N above (the first problems of the file). Aggregate tok/s, mean of thre
 | vLLM 0.31 autoregressive | 332 | 671 | 1237 | 2143 | 3678 | 5891 | 10139 | 13939 |
 | GSM8K accuracy (%), adaptive fused | 90.6 | 88.3 | 91.4 | 90.6 | 91.4 | 91.4 | 89.8 | 91.2 |
 
-- **Against vLLM.** Adaptive fused is 3.8 / 2.8 / 2.3 / 1.6 / 1.6 / 1.25× DFlash at N = 1–32. At 64 and 128, over two
+- **Against vLLM.** Adaptive fused is 3.8 / 2.8 / 2.2 / 1.6 / 1.6 / 1.25× DFlash at N = 1–32. At 64 and 128, over two
   prompt windows (problems 0+ and 512+), it averages 21430 and 23935 tok/s: 1.14× and 1.19× DFlash, 2.1× and 1.7×
   autoregressive decoding.
 - **Against the fixed lengths.** The adaptive engine runs the best fixed length's canvases in steady state (256 at

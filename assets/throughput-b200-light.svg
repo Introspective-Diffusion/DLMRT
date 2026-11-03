@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 470" width="860" height="470" role="img" aria-label="Throughput on one B200: dlmrt, vLLM + DFlash, vLLM"><title>Throughput on one B200: dlmrt, vLLM + DFlash, vLLM</title><defs></defs>
+<text x="24" y="32" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="700" fill="#1F2328" text-anchor="start">Throughput on one B200</text>
+<text x="24" y="54" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636E" text-anchor="start">DiffusionGemma 26B-A4B + ORL in dlmrt against Gemma 4 26B-A4B in vLLM 0.31 · NVFP4 · GSM8K prompts, closed loop</text>
+<path d="M 84 404.0 L 772 404.0" fill="none" stroke="#D0D7DE" stroke-width="1"/>
+<text x="74" y="408.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636E" text-anchor="end">0</text>
+<path d="M 84 324.0 L 772 324.0" fill="none" stroke="#D0D7DE" stroke-width="1"/>
+<text x="74" y="328.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636E" text-anchor="end">5K</text>
+<path d="M 84 244.0 L 772 244.0" fill="none" stroke="#D0D7DE" stroke-width="1"/>
+<text x="74" y="248.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636E" text-anchor="end">10K</text>
+<path d="M 84 164.0 L 772 164.0" fill="none" stroke="#D0D7DE" stroke-width="1"/>
+<text x="74" y="168.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636E" text-anchor="end">15K</text>
+<path d="M 84 84.0 L 772 84.0" fill="none" stroke="#D0D7DE" stroke-width="1"/>
+<text x="74" y="88.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#59636E" text-anchor="end">20K</text>
+<text x="114.0" y="426" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636E" text-anchor="middle">1</text>
+<text x="239.6" y="426" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636E" text-anchor="middle">2</text>
+<text x="365.2" y="426" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636E" text-anchor="middle">4</text>
+<text x="490.79999999999995" y="426" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636E" text-anchor="middle">8</text>
+<text x="616.4" y="426" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636E" text-anchor="middle">16</text>
+<text x="742.0" y="426" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636E" text-anchor="middle">32</text>
+<text x="428.0" y="452" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636E" text-anchor="middle">requests in flight</text>
+<text x="28" y="244.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#59636E" text-anchor="middle" transform="rotate(-90 28 244.0)">output tokens / s, all requests</text>
+<path d="M 114.0 398.7 L 239.6 393.3 L 365.2 384.2 L 490.8 369.7 L 616.4 345.2 L 742.0 309.7" fill="none" stroke="#8C959F" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="114.0" cy="398.7" r="4" fill="#8C959F"/>
+<circle cx="239.6" cy="393.3" r="4" fill="#8C959F"/>
+<circle cx="365.2" cy="384.2" r="4" fill="#8C959F"/>
+<circle cx="490.8" cy="369.7" r="4" fill="#8C959F"/>
+<circle cx="616.4" cy="345.2" r="4" fill="#8C959F"/>
+<circle cx="742.0" cy="309.7" r="4" fill="#8C959F"/>
+<text x="754.0" y="314.244" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#8C959F" text-anchor="start">5.9K</text>
+<path d="M 114.0 385.6 L 239.6 371.2 L 365.2 346.6 L 490.8 300.4 L 616.4 255.0 L 742.0 180.9" fill="none" stroke="#BC4C00" stroke-width="2.4" stroke-linejoin="round"/>
+<circle cx="114.0" cy="385.6" r="4.5" fill="#BC4C00"/>
+<circle cx="239.6" cy="371.2" r="4.5" fill="#BC4C00"/>
+<circle cx="365.2" cy="346.6" r="4.5" fill="#BC4C00"/>
+<circle cx="490.8" cy="300.4" r="4.5" fill="#BC4C00"/>
+<circle cx="616.4" cy="255.0" r="4.5" fill="#BC4C00"/>
+<circle cx="742.0" cy="180.9" r="4.5" fill="#BC4C00"/>
+<text x="754.0" y="185.396" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#BC4C00" text-anchor="start">13.9K</text>
+<path d="M 114.0 335.0 L 239.6 311.2 L 365.2 275.1 L 490.8 241.5 L 616.4 169.8 L 742.0 124.1" fill="none" stroke="#2EA44F" stroke-width="3" stroke-linejoin="round"/>
+<circle cx="114.0" cy="335.0" r="5" fill="#2EA44F"/>
+<circle cx="239.6" cy="311.2" r="5" fill="#2EA44F"/>
+<circle cx="365.2" cy="275.1" r="5" fill="#2EA44F"/>
+<circle cx="490.8" cy="241.5" r="5" fill="#2EA44F"/>
+<circle cx="616.4" cy="169.8" r="5" fill="#2EA44F"/>
+<circle cx="742.0" cy="124.1" r="5" fill="#2EA44F"/>
+<text x="754.0" y="128.644" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#2EA44F" text-anchor="start">17.5K</text>
+<text x="114.0" y="322.024" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#2EA44F" text-anchor="middle">3.8×</text>
+<text x="239.6" y="298.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#2EA44F" text-anchor="middle">2.8×</text>
+<text x="365.2" y="262.12" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#2EA44F" text-anchor="middle">2.2×</text>
+<text x="490.79999999999995" y="228.488" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#2EA44F" text-anchor="middle">1.6×</text>
+<text x="616.4" y="156.792" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#2EA44F" text-anchor="middle">1.6×</text>
+<text x="742.0" y="111.144" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="700" fill="#2EA44F" text-anchor="middle">1.25×</text>
+<path d="M 104 102 L 132 102" fill="none" stroke="#2EA44F" stroke-width="3"/>
+<circle cx="118" cy="102" r="5" fill="#2EA44F"/>
+<text x="142" y="106.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1F2328" text-anchor="start">dlmrt, batched DiffusionGemma</text>
+<path d="M 104 126 L 132 126" fill="none" stroke="#BC4C00" stroke-width="2.4"/>
+<circle cx="118" cy="126" r="4.5" fill="#BC4C00"/>
+<text x="142" y="130.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1F2328" text-anchor="start">vLLM + DFlash speculative decoding (best draft length per point)</text>
+<path d="M 104 150 L 132 150" fill="none" stroke="#8C959F" stroke-width="2.2"/>
+<circle cx="118" cy="150" r="4" fill="#8C959F"/>
+<text x="142" y="154.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#1F2328" text-anchor="start">vLLM, autoregressive</text>
+<text x="104" y="178.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" font-weight="600" fill="#2EA44F" text-anchor="start">× labels: dlmrt over vLLM + DFlash at that concurrency</text>
+</svg>

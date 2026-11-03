@@ -1,5 +1,6 @@
 """Draw the documentation figures, assets/<figure>-light.svg and assets/<figure>-dark.svg: docs/architecture.md's
-block graph (block-graph) and docs/batched.md's batched engine (batched-launch, batched-stages, batched-schedule).
+block graph (block-graph), docs/batched.md's batched engine (batched-launch, batched-stages, batched-schedule) and
+the README's B200 throughput chart (throughput-b200, from docs/batched.md's measurements).
 
 usage: python tools/architecture_svg.py [repo root]
 """
@@ -383,6 +384,67 @@ def batched_schedule():
     return p
 
 
+# docs/batched.md's measurements on one B200: aggregate tok/s per concurrency (closed loop, GSM8K prompts).
+LEVELS = (1, 2, 4, 8, 16, 32, 64, 128)
+THROUGHPUT = {
+    "dlmrt": (4311, 5800, 8055, 10157, 14638, 17491, 21168, 23720),  # batched engine, the default configuration
+    "dflash": (1148, 2050, 3587, 6478, 9315, 13944, 18835, 20069),  # vLLM 0.31, best draft length per level
+    "ar": (332, 671, 1237, 2143, 3678, 5891, 10139, 13939),  # vLLM 0.31, autoregressive
+}
+CHART_LEVELS = 6  # concurrencies shown: 1-32
+
+
+def throughput_b200():
+    """dlmrt's batched engine against vLLM's DFlash and autoregressive decoding on one B200."""
+    p = []
+    left, right, top, bottom, most = 84, 772, 84, 404, 20000
+    levels = LEVELS[:CHART_LEVELS]
+    step = (right - left - 60) / (len(levels) - 1)
+
+    def px(i):
+        return left + 30 + i * step
+
+    def py(v):
+        return bottom - v / most * (bottom - top)
+
+    p.append(text(24, 32, "Throughput on one B200", size=16, weight=700))
+    p.append(text(24, 54, "DiffusionGemma 26B-A4B + ORL in dlmrt against Gemma 4 26B-A4B in vLLM 0.31 · NVFP4 · "
+                  "GSM8K prompts, closed loop", size=12.5, fill="muted"))
+    for v in range(0, most + 1, 5000):
+        p.append(line(left, py(v), right, py(v), color="box_line", width=1))
+        p.append(text(left - 10, py(v) + 4, f"{v // 1000}K" if v else "0", size=12, fill="muted", anchor="end"))
+    for i, n in enumerate(levels):
+        p.append(text(px(i), bottom + 22, str(n), size=12.5, fill="muted", anchor="middle"))
+    p.append(text((left + right) / 2, bottom + 48, "requests in flight", size=12.5, fill="muted", anchor="middle"))
+    p.append(text(28, (top + bottom) / 2, "output tokens / s, all requests", size=12.5, fill="muted",
+                  anchor="middle", style=f' transform="rotate(-90 28 {(top + bottom) / 2})"'))
+
+    series = (("ar", "line", 2.2, 4, "vLLM, autoregressive"),
+              ("dflash", "commit", 2.4, 4.5, "vLLM + DFlash speculative decoding (best draft length per point)"),
+              ("dlmrt", "accent", 3, 5, "dlmrt, batched DiffusionGemma"))
+    for key, color, width, r, _ in series:
+        pts = [(px(i), py(v)) for i, v in enumerate(THROUGHPUT[key][:len(levels)])]
+        path = "M " + " L ".join(f"{x:.1f} {y:.1f}" for x, y in pts)
+        p.append(f'<path d="{path}" fill="none" stroke="{{{color}}}" stroke-width="{width}" stroke-linejoin="round"/>')
+        for x, y in pts:
+            p.append(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r}" fill="{{{color}}}"/>')
+        last = THROUGHPUT[key][len(levels) - 1]
+        p.append(text(pts[-1][0] + 12, pts[-1][1] + 4.5, f"{last / 1000:.1f}K", size=12.5, weight=600, fill=color))
+    for i, (d, f) in enumerate(zip(THROUGHPUT["dlmrt"][:len(levels)], THROUGHPUT["dflash"])):
+        ratio = d / f
+        p.append(text(px(i), py(d) - 13, f"{ratio:.2f}×" if ratio < 1.5 else f"{ratio:.1f}×", size=12.5,
+                      weight=700, fill="accent", anchor="middle"))
+
+    for j, (_, color, width, r, label) in enumerate(reversed(series)):
+        y = top + 18 + 24 * j
+        p.append(line(left + 20, y, left + 48, y, color=color, width=width))
+        p.append(f'<circle cx="{left + 34}" cy="{y}" r="{r}" fill="{{{color}}}"/>')
+        p.append(text(left + 58, y + 4.5, label, size=12.5))
+    p.append(text(left + 20, top + 18 + 24 * 3 + 4.5, "× labels: dlmrt over vLLM + DFlash at that concurrency",
+                  size=12.5, weight=600, fill="accent"))
+    return p
+
+
 FIGURES = {
     # name: (parts, width, height, label, arrowhead colors)
     "block-graph": (block_graph, 1000, 560, "dlmrt block graph", ("line", "accent", "accent_soft")),
@@ -390,6 +452,7 @@ FIGURES = {
     "batched-stages": (batched_stages, 1000, 440, "dlmrt batched engine: a request's stages",
                        ("line", "accent", "lane")),
     "batched-schedule": (batched_schedule, 1000, 420, "dlmrt batched engine: an example schedule", ()),
+    "throughput-b200": (throughput_b200, 860, 470, "Throughput on one B200: dlmrt, vLLM + DFlash, vLLM", ()),
 }
 
 
