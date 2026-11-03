@@ -91,7 +91,10 @@ on H100. Methodology and every measurement: [docs/performance.md](docs/performan
 DiffusionGemma + ORL through the batched engine on one B200, against Gemma 4 26B-A4B in vLLM 0.31 on the same
 prompts, autoregressive and with a DFlash drafter at its best draft length per concurrency: aggregate output tok/s in
 closed loop, mean of three runs. At 64 and 128 requests dlmrt reaches 21.2K and 23.7K tok/s (1.12× and 1.18× DFlash).
-Every measurement, the GSM8K accuracy per level and the caveats: [docs/batched.md](docs/batched.md#measured-on-one-b200).
+Each request's canvas length follows the load: 256 rows for one or two requests, 128 up to 11, 32 beyond; under a load
+that rises from 1 to 64 requests and falls back, that is 1.06–1.87× the throughput of any single canvas length
+([canvas length by load](docs/batched.md#canvas-length-by-load)). Every measurement, the GSM8K accuracy per level and
+the caveats: [docs/batched.md](docs/batched.md#measured-on-one-b200).
 
 ## Installation
 

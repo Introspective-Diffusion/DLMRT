@@ -118,6 +118,46 @@ canvas. No canvas waits for another, and prompts are prefilled inside the shared
   at start; the buckets follow FlashInfer's MoE token buckets, so every forward's row count runs its own tuned expert
   tactic.
 
+### Canvas length by load
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/canvas-b200-dark.svg">
+  <img alt="Closed-loop throughput on one B200 at 1 to 32 requests in flight. Fixed 256-row canvases: 4.3K, 5.8K,
+  7.2K, 8.2K, 8.8K, 9.0K tok/s; fixed 128: 3.8K, 5.6K, 8.1K, 10.0K, 11.5K, 12.1K; fixed 32 with commit lanes: 2.2K,
+  3.8K, 6.1K, 10.1K, 13.9K, 17.6K; the adaptive engine: 4.3K, 5.8K, 8.1K, 10.2K, 14.6K, 17.5K, running 256-row
+  canvases at 1 and 2 requests, 128 at 4 and 8, and 32 at 16 and 32." src="../assets/canvas-b200-light.svg"
+  width="100%">
+</picture>
+
+Which canvas length serves best depends on the load. With one request, a 256-row canvas settles about 29 tokens per
+round at 5.6 ms per forward and a 32-row canvas about 10 at 3.2 ms: the forward is bound by reading the weights, the
+extra rows cost little, and 256 rows run 1.9× faster (4296 against 2242 tok/s). Under load every request's rows add
+to the forward and the tokens a row settles decide: 0.33 per round for 32-row canvases, 0.16 for 128 and 0.11 for 256
+rows, so from 16 requests on 32-row canvases are fastest (13.9K tok/s at 16 requests, against 11.5K at 128 rows and
+8.8K at 256).
+
+The engine holds graphs for 256-, 128- and 32-row canvases over one set of weights and picks the length from the load.
+`LoadPolicy()` follows the crossovers of the fixed lengths above: 256 rows up to 2 requests, 128 up to 11, then 32,
+keeping the current length while the load is within one request of its range, so a load that moves by one request
+does not switch back and forth. A request takes the new length at its next canvas ([Scheduling](#scheduling)).
+
+In steady state the adaptive engine runs the best fixed length's canvases at its throughput (0.996–1.006× at 1–8 and
+32 requests), and passes it where the last requests of a level, as it drains, run longer canvases (1.05× at 16
+requests, 1.07× / 1.05× at 64 / 128). Its gain is under a changing load:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/phased-b200-dark.svg">
+  <img alt="Output tokens completed over time on one B200 while the load goes 1, 4, 16, 64, 16 and 1 requests in
+  flight over 408 GSM8K requests. The adaptive engine finishes in 6.4 s (16.6K tok/s), fixed 32-row canvases with
+  commit lanes in 6.8 s (15.6K tok/s), fixed 128 in 9.2 s (11.5K tok/s) and fixed 256 in 12.2 s (8.9K tok/s). The
+  adaptive run uses 256-row canvases while one request runs, 128 at 4 requests, 32 from 16 requests on, then 128 and
+  256 again as the load falls." src="../assets/phased-b200-light.svg" width="100%">
+</picture>
+
+It runs 256-row canvases while one request runs, 128 at 4 and 32 from 16 on, and back, and serves the 408 requests at
+16.6K tok/s: 1.06× the throughput of fixed 32 with commit lanes, slow in the low-load phases, and 1.44× / 1.87× that
+of fixed 128 / 256, slow under load.
+
 ### Scheduling
 
 <picture>
@@ -181,8 +221,9 @@ and 4 × N above (the first problems of the file). Aggregate tok/s, mean of thre
   autoregressive decoding.
 - **Against the fixed lengths.** The adaptive engine runs the best fixed length's canvases in steady state (256 at
   N ≤ 2, 128 at 4–8, 32 from 16) and gains at the end of each level, when the last requests move to longer canvases.
-  Under phased load (1 → 4 → 16 → 64 → 16 → 1 requests in flight, 408 requests, max_batch 64) it finishes 1.06× faster
-  than fixed 32 with lanes and 1.44× / 1.87× faster than fixed 128 / 256 (16.6K tok/s goodput).
+  Under phased load (1 → 4 → 16 → 64 → 16 → 1 requests in flight, 408 requests, max_batch 64) its throughput is 1.06×
+  that of fixed 32 with lanes and 1.44× / 1.87× that of fixed 128 / 256 (16.6K tok/s goodput; charts in
+  [Canvas length by load](#canvas-length-by-load)).
 - **Batch 1.** With one request the engine emits GemmaEngine's tokens and denoise steps at 1.00–1.02× its speed
   (1024 tokens, EOS ignored, best of three: 85.8 vs 86.8 ms at 256-row canvases, 461.9 vs 471.6 ms at 32; within ±1%
   with other jobs on the node).
