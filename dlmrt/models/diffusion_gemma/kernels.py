@@ -42,8 +42,9 @@ def _key(seed, block, step):
 
 
 @triton.jit
-def _embed(IDS, E, D, Y, MODES, SLOTS, STEP, START, END, LEFT, STATE, scale, eps, N: tl.constexpr, G: tl.constexpr,
-           HAS_D: tl.constexpr, DECODER: tl.constexpr, MIXED: tl.constexpr = False, HAS_STATE: tl.constexpr = False):
+def _embed(IDS, E, D, Y, MODES, SLOTS, STEP, INDEX, START, END, LEFT, STATE, scale, eps, N: tl.constexpr,
+           G: tl.constexpr, HAS_D: tl.constexpr, DECODER: tl.constexpr, MIXED: tl.constexpr = False,
+           LANES: tl.constexpr = False, HAS_STATE: tl.constexpr = False):
     _wait()
     row = tl.program_id(0)
     cols, mask = _row_tile(N, G)
@@ -52,6 +53,7 @@ def _embed(IDS, E, D, Y, MODES, SLOTS, STEP, START, END, LEFT, STATE, scale, eps
     if MIXED:
         # Row r of the request at slot SLOTS[r]: a canvas (mode DENOISE) takes the decoder path, other modes the plain
         # one. Round 0's SC delta is zero (no previous logits), so it is not read (the rows carry a stale one).
+        # LANES: rows at a negative INDEX are a commit lane (causal rows before the canvas), plain too.
         slot = tl.load(SLOTS + row)
         mode = tl.load(MODES + slot)
         if HAS_STATE:
@@ -60,7 +62,10 @@ def _embed(IDS, E, D, Y, MODES, SLOTS, STEP, START, END, LEFT, STATE, scale, eps
             tl.store(STATE + row * 4 + 1, tl.load(END + slot))
             tl.store(STATE + row * 4 + 2, tl.load(LEFT + slot))
             tl.store(STATE + row * 4 + 3, mode)
-        if mode == DENOISE:
+        canvas = mode == DENOISE
+        if LANES:
+            canvas = canvas & (tl.load(INDEX + row) >= 0)
+        if canvas:
             if tl.load(STEP + slot) > 0:
                 x = _bf(x + tl.load(D + row * N + cols, mask, 0.0).to(tl.float32))
             x = _rms(x, N, eps)
@@ -72,17 +77,19 @@ def _embed(IDS, E, D, Y, MODES, SLOTS, STEP, START, END, LEFT, STATE, scale, eps
     _release()
 
 
-def embed(ids, embedding, scale, out, eps, *, decoder, delta=None, modes=None, slots=None, step=None, state=None):
+def embed(ids, embedding, scale, out, eps, *, decoder, delta=None, modes=None, slots=None, step=None, index=None,
+          state=None):
     """E[ids] * scale; the decoder adds the SC delta and applies the unweighted post-norm. `modes` and `step` (per KV
     slot, with `slots` per row): the decoder path for the rows of requests in mode DENOISE only, the delta from
-    round 1 on. `state` (with `modes`): (start, end, left per slot, out [rows, 4] int32) to gather each row's
-    (start, end, left, mode) into."""
+    round 1 on. `index` (per row): rows at a negative index (commit lanes) take the plain path. `state` (with
+    `modes`): (start, end, left per slot, out [rows, 4] int32) to gather each row's (start, end, left, mode) into."""
     n = embedding.shape[1]
     start, end, left, rows = state if state is not None else (ids,) * 4
     _embed[(ids.numel(),)](ids, embedding, delta if delta is not None else out, out,
                            modes if modes is not None else ids, slots if slots is not None else ids,
-                           step if step is not None else ids, start, end, left, rows, scale, eps, n, _groups(n),
-                           delta is not None, decoder, modes is not None, state is not None, num_warps=8, **LAUNCH)
+                           step if step is not None else ids, index if index is not None else ids, start, end, left,
+                           rows, scale, eps, n, _groups(n), delta is not None, decoder, modes is not None,
+                           index is not None, state is not None, num_warps=8, **LAUNCH)
     return out
 
 
@@ -746,47 +753,58 @@ def decide(stats, argmax, sample, tokens, out, accepted, step, remaining, seed, 
 
 @triton.jit
 def _advance(MODE, P, TOKENS, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK, SLOTS, OFFSETS, BLOCKS,
-             WANT, PROMPT, PLEN, MAX_NEW, TOKEN_OUT, STEP_OUT, BLOCK_OUT, CLOCK_OUT, CANVASES, EOS, CTRL, COUNTS, window,
-             prompt_stride, out_stride, steps_stride, limit, VOCAB: tl.constexpr, NEOS: tl.constexpr, B: tl.constexpr,
-             B1: tl.constexpr = 0, B2: tl.constexpr = 0, B3: tl.constexpr = 0):
+             WANT, PROMPT, PLEN, MAX_NEW, TOKEN_OUT, STEP_OUT, BLOCK_OUT, CLOCK_OUT, CANVASES, EOS, CTRL, COUNTS, LANE,
+             WANTS, window, prompt_stride, out_stride, steps_stride, limit, VOCAB: tl.constexpr, NEOS: tl.constexpr,
+             B: tl.constexpr, B1: tl.constexpr = 0, B2: tl.constexpr = 0, B3: tl.constexpr = 0,
+             FUSED: tl.constexpr = False):
     """After a batched forward, one program per request: its state at slot SLOTS[program], its BLOCKS[slot] rows from
-    OFFSETS[slot] (canvas lengths B, B1, B2, B3; 0: unused), see _advance_one."""
+    OFFSETS[slot] (canvas lengths B, B1, B2, B3; 0: unused), see _advance_one. FUSED: WANTS[program] = 1 if its canvas
+    stopped and waits for a commit lane (see _claim), else 0."""
     _wait()
-    slot = tl.load(SLOTS + tl.program_id(0))
+    p = tl.program_id(0)
+    slot = tl.load(SLOTS + p)
     rows = tl.load(BLOCKS + slot)
     o = tl.load(OFFSETS + slot)
+    if FUSED:
+        tl.store(WANTS + p, 0)
     if rows == B:
         _advance_one(MODE, P, TOKENS, o, OUT + o, ACCEPTED + o, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK, WANT,
-                     PROMPT, PLEN, MAX_NEW, TOKEN_OUT, STEP_OUT, BLOCK_OUT, CLOCK_OUT, CANVASES, EOS, CTRL, COUNTS, slot,
-                     window, prompt_stride, out_stride, steps_stride, limit, VOCAB, B, NEOS)
+                     PROMPT, PLEN, MAX_NEW, TOKEN_OUT, STEP_OUT, BLOCK_OUT, CLOCK_OUT, CANVASES, EOS, CTRL, COUNTS,
+                     LANE, WANTS + p, slot, window, prompt_stride, out_stride, steps_stride, limit, VOCAB, B, NEOS,
+                     FUSED)
     if B1 > 0:
         if rows == B1:
             _advance_one(MODE, P, TOKENS, o, OUT + o, ACCEPTED + o, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK,
                          WANT, PROMPT, PLEN, MAX_NEW, TOKEN_OUT, STEP_OUT, BLOCK_OUT, CLOCK_OUT, CANVASES, EOS, CTRL,
-                         COUNTS, slot, window, prompt_stride, out_stride, steps_stride, limit, VOCAB, B1, NEOS)
+                         COUNTS, LANE, WANTS + p, slot, window, prompt_stride, out_stride, steps_stride, limit, VOCAB,
+                         B1, NEOS, FUSED)
     if B2 > 0:
         if rows == B2:
             _advance_one(MODE, P, TOKENS, o, OUT + o, ACCEPTED + o, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK,
                          WANT, PROMPT, PLEN, MAX_NEW, TOKEN_OUT, STEP_OUT, BLOCK_OUT, CLOCK_OUT, CANVASES, EOS, CTRL,
-                         COUNTS, slot, window, prompt_stride, out_stride, steps_stride, limit, VOCAB, B2, NEOS)
+                         COUNTS, LANE, WANTS + p, slot, window, prompt_stride, out_stride, steps_stride, limit, VOCAB,
+                         B2, NEOS, FUSED)
     if B3 > 0:
         if rows == B3:
             _advance_one(MODE, P, TOKENS, o, OUT + o, ACCEPTED + o, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK,
                          WANT, PROMPT, PLEN, MAX_NEW, TOKEN_OUT, STEP_OUT, BLOCK_OUT, CLOCK_OUT, CANVASES, EOS, CTRL,
-                         COUNTS, slot, window, prompt_stride, out_stride, steps_stride, limit, VOCAB, B3, NEOS)
+                         COUNTS, LANE, WANTS + p, slot, window, prompt_stride, out_stride, steps_stride, limit, VOCAB,
+                         B3, NEOS, FUSED)
     _release()
 
 
 @triton.jit
 def _advance_one(MODE, P, ROWS, o, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK, WANT, PROMPT, PLEN,
-                 MAX_NEW, TOKEN_OUT, STEP_OUT, BLOCK_OUT, CLOCK_OUT, CANVASES, EOS, CTRL, COUNTS, slot, window,
-                 prompt_stride, out_stride, steps_stride, limit, VOCAB: tl.constexpr, B: tl.constexpr,
-                 NEOS: tl.constexpr):
+                 MAX_NEW, TOKEN_OUT, STEP_OUT, BLOCK_OUT, CLOCK_OUT, CANVASES, EOS, CTRL, COUNTS, LANE, WANTS, slot,
+                 window, prompt_stride, out_stride, steps_stride, limit, VOCAB: tl.constexpr, B: tl.constexpr,
+                 NEOS: tl.constexpr, FUSED: tl.constexpr):
     """One request of B rows from row o (ROWS: the token rows of the batch; OUT / ACCEPTED at its rows):
     DENOISE, canvas stopped (by the decoder, or after `limit` rounds as GemmaEngine's loop bound): record it
         (TOKEN_OUT after the earlier canvases' tokens, STEP_OUT / BLOCK_OUT per canvas, CLOCK_OUT the run's forwards
         before this one, COUNTS[16]); it ends the request (DONE, CTRL[2] += 1) with an EOS within the token budget or
-        as the last canvas, uncommitted; otherwise it is committed next (COMMIT).
+        as the last canvas, uncommitted; otherwise it is committed next (COMMIT), or, FUSED, when this launch has
+        lanes (LANE[0] > 0) of at least B rows and the next canvas has the same length, it waits for a commit lane
+        (*WANTS = 1, still DENOISE with REMAINING 0; _claim).
     COMMIT (just committed): the next canvas.
     PREFILL (a prompt chunk of B tokens just committed): the next chunk, or the first canvas after the prompt.
     The next canvas begins if the request's wanted canvas length WANT[slot] is B, else see _next_canvas."""
@@ -813,8 +831,15 @@ def _advance_one(MODE, P, ROWS, o, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REM
                 tl.store(CANVASES + slot, ordinal + 1)
                 tl.atomic_add(CTRL + 2, 1)
             else:
-                tl.store(TOKENS + i, canvas)
-                tl.store(MODE + slot, COMMIT)
+                if FUSED:
+                    if (tl.load(WANT + slot) == B) & (tl.load(LANE) > 0) & (tl.load(LANE + 1) >= B):
+                        tl.store(WANTS, 1)
+                    else:
+                        tl.store(TOKENS + i, canvas)
+                        tl.store(MODE + slot, COMMIT)
+                else:
+                    tl.store(TOKENS + i, canvas)
+                    tl.store(MODE + slot, COMMIT)
     elif mode == COMMIT:
         offset = tl.load(P) + B
         ordinal = tl.load(P + 1) + 1
@@ -853,16 +878,133 @@ def _next_canvas(MODE, P, TOKENS, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REMA
 
 def advance(mode, params, tokens, out, accepted, start, end, leftpad, step, remaining, seed, block, slots, offsets,
             blocks, want, prompt, prompt_len, max_new, token_out, step_out, block_out, canvases, eos, ctrl, window,
-            vocab, classes, limit, *, clock=None):
-    """`clock`: (counts, clock_out like step_out): each stopped canvas records counts[16] (forwards before this one);
+            vocab, classes, limit, *, lanes=None, clock=None):
+    """`lanes`: (lane state, waiting flag per request position) for fused commits (see _advance_one, _claim).
+    `clock`: (counts, clock_out like step_out): each stopped canvas records counts[16] (forwards before this one);
     none: not recorded."""
     b, _ = _classes(classes, classes)
+    lane, wants = lanes if lanes is not None else (ctrl, ctrl)
     counts, clock_out = clock if clock is not None else (torch.zeros(17, device=ctrl.device, dtype=torch.int32),
                                                          torch.empty_like(step_out))
     _advance[(slots.numel(),)](mode, params, tokens, out, accepted, start, end, leftpad, step, remaining, seed, block,
                                slots, offsets, blocks, want, prompt, prompt_len, max_new, token_out, step_out,
-                               block_out, clock_out, canvases, eos, ctrl, counts, window, prompt.shape[1],
-                               token_out.shape[1], step_out.shape[1], limit, vocab, eos.numel(), *b, **LAUNCH)
+                               block_out, clock_out, canvases, eos, ctrl, counts, lane, wants, window, prompt.shape[1],
+                               token_out.shape[1], step_out.shape[1], limit, vocab, eos.numel(), *b, lanes is not None,
+                               **LAUNCH)
+
+
+@triton.jit
+def _claim(MODE, P, ROWS, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK, SLOTS, OFFSETS, BLOCKS,
+           WANTS, LANE, ROW_SLOT, ROW_INDEX, window, N: tl.constexpr, NP: tl.constexpr, VOCAB: tl.constexpr,
+           B: tl.constexpr, B1: tl.constexpr = 0, B2: tl.constexpr = 0, B3: tl.constexpr = 0):
+    """After `advance` (fused), one program per request position: the canvases waiting for a commit lane (WANTS[p]
+    = 1) take the launch's LANE[0] lanes in position order, the rest commit in their own rows next (see _claim_one).
+    Program 0 keeps the lane counters (LANE layout in batched.py): lanes claimed, lane commits and their rows, and
+    the waiting canvases per canvas length (B, B1, B2, B3)."""
+    _wait()
+    p = tl.program_id(0)
+    j = tl.arange(0, NP)
+    live = j < N
+    wants = tl.load(WANTS + j, live, 0)
+    lanes = tl.load(LANE)
+    if tl.load(WANTS + p) != 0:
+        rank = tl.sum(tl.where(j < p, wants, 0), 0)
+        slot = tl.load(SLOTS + p)
+        rows = tl.load(BLOCKS + slot)
+        o = tl.load(OFFSETS + slot)
+        if rows == B:
+            _claim_one(MODE, P, ROWS, o, OUT + o, ACCEPTED + o, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK,
+                       LANE, ROW_SLOT, ROW_INDEX, slot, rank, lanes, window, VOCAB, B)
+        if B1 > 0:
+            if rows == B1:
+                _claim_one(MODE, P, ROWS, o, OUT + o, ACCEPTED + o, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK,
+                           LANE, ROW_SLOT, ROW_INDEX, slot, rank, lanes, window, VOCAB, B1)
+        if B2 > 0:
+            if rows == B2:
+                _claim_one(MODE, P, ROWS, o, OUT + o, ACCEPTED + o, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK,
+                           LANE, ROW_SLOT, ROW_INDEX, slot, rank, lanes, window, VOCAB, B2)
+        if B3 > 0:
+            if rows == B3:
+                _claim_one(MODE, P, ROWS, o, OUT + o, ACCEPTED + o, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK,
+                           LANE, ROW_SLOT, ROW_INDEX, slot, rank, lanes, window, VOCAB, B3)
+    if p == 0:
+        rows = tl.load(BLOCKS + tl.load(SLOTS + j, live, 0), live, 0)
+        got = (wants != 0) & (tl.cumsum(wants, 0) - wants < lanes)
+        claimed = tl.sum(got.to(tl.int32), 0)
+        tl.store(LANE + 3, claimed)
+        tl.store(LANE + 4, tl.load(LANE + 4) + claimed)
+        tl.store(LANE + 5, tl.load(LANE + 5) + tl.sum(tl.where(got, rows, 0), 0))
+        _count_class(LANE + 8, wants != 0, rows, B)
+        _count_class(LANE + 9, wants != 0, rows, B1)
+        _count_class(LANE + 10, wants != 0, rows, B2)
+        _count_class(LANE + 11, wants != 0, rows, B3)
+    _release()
+
+
+@triton.jit
+def _count_class(COUNT, sel, rows, B: tl.constexpr):
+    """*COUNT += the selected requests of canvas length B (B = 0: unused class)."""
+    if B > 0:
+        tl.store(COUNT, tl.load(COUNT) + tl.sum((sel & (rows == B)).to(tl.int32), 0))
+
+
+@triton.jit
+def _claim_one(MODE, P, ROWS, o, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK, LANE, ROW_SLOT,
+               ROW_INDEX, slot, rank, lanes, window, VOCAB: tl.constexpr, B: tl.constexpr):
+    """A stopped canvas of B rows from row o, the rank-th waiting one in position order. Within the launch's `lanes`
+    (LANE = [lanes, rows per lane, first lane row, ...]): copy its tokens to lane `rank`, map the lane's rows to its
+    slot at indices -B..-1 (positions start - B.., causal, start being the next canvas's), record (slot, B) at
+    LANE[16 + 2 rank] and begin the next canvas, whose first round runs in the same forward as the commit. Past
+    them: commit in its own rows next (COMMIT), as without lanes."""
+    i = tl.arange(0, B)
+    TOKENS = ROWS + o
+    P += slot * 3
+    canvas = tl.load(OUT + i)
+    if rank < lanes:
+        first = tl.load(LANE + 2) + rank * tl.load(LANE + 1)
+        tl.store(ROWS + first + i, canvas)
+        tl.store(ROW_SLOT + first + i, slot)
+        tl.store(ROW_INDEX + first + i, i - B)
+        tl.store(LANE + 16 + 2 * rank, slot)
+        tl.store(LANE + 17 + 2 * rank, B)
+        offset = tl.load(P) + B
+        ordinal = tl.load(P + 1) + 1
+        tl.store(P, offset)
+        tl.store(P + 1, ordinal)
+        _start_canvas(TOKENS, OUT, ACCEPTED, START, END, LEFTPAD, STEP, REMAINING, SEED, BLOCK, slot, offset, ordinal,
+                      tl.load(P + 2), window, VOCAB, B)
+    else:
+        tl.store(TOKENS + i, canvas)
+        tl.store(MODE + slot, COMMIT)
+
+
+def claim(mode, params, tokens, out, accepted, start, end, leftpad, step, remaining, seed, block, slots, offsets,
+          blocks, wants, lane, row_slot, row_index, window, vocab, classes):
+    """Commit lanes for the canvases `advance` left waiting, in request-position order (see _claim)."""
+    b, _ = _classes(classes, classes)
+    n = slots.numel()
+    _claim[(n,)](mode, params, tokens, out, accepted, start, end, leftpad, step, remaining, seed, block, slots, offsets,
+                 blocks, wants, lane, row_slot, row_index, window, n, triton.next_power_of_2(n), vocab, *b, **LAUNCH)
+
+
+@triton.jit
+def _release_lanes(LANE, ROW_SLOT, ROW_INDEX, idle, B0: tl.constexpr):
+    """Before the lanes are claimed again: their rows (B0 per program) back to the idle slot, no lane claimed."""
+    _wait()
+    p = tl.program_id(0)
+    i = tl.arange(0, B0)
+    row = tl.load(LANE + 2) + p * B0 + i
+    live = p * B0 + i < tl.load(LANE) * tl.load(LANE + 1)
+    tl.store(ROW_SLOT + row, idle, live)
+    tl.store(ROW_INDEX + row, i, live)
+    if p == 0:
+        tl.store(LANE + 3, 0)
+    _release()
+
+
+def release_lanes(lane, row_slot, row_index, idle, b0, rows):
+    """`rows`: the most lane rows there can be."""
+    _release_lanes[(max(1, rows // b0),)](lane, row_slot, row_index, idle, b0, **LAUNCH)
 
 
 @triton.jit
@@ -921,14 +1063,17 @@ def admit(mode, params, tokens, out, accepted, start, end, leftpad, step, remain
 
 
 @triton.jit
-def _control(MODE, STEP, SLOTS, BLOCKS, CTRL, COUNTS, N: tl.constexpr, NP: tl.constexpr, ROWS: tl.constexpr,
-             HEAD: tl.constexpr):
+def _control(MODE, STEP, SLOTS, BLOCKS, CTRL, COUNTS, LANE, N: tl.constexpr, NP: tl.constexpr, ROWS: tl.constexpr,
+             HEAD: tl.constexpr, FUSED: tl.constexpr = False, B: tl.constexpr = 0, B1: tl.constexpr = 0,
+             B2: tl.constexpr = 0, B3: tl.constexpr = 0):
     """The batched loop's WHILE state CTRL = [run, forwards, finished, finish limit, denoising, conditioned, clock]: run
     while some request is in PREFILL / DENOISE / COMMIT and fewer than CTRL[3] have finished (or parked, SWITCH) since
     the launch (HEAD: the launch's start); CTRL[4] = 1 if the next forward has a canvas round, CTRL[5] = 1 if one of
     them is past round 0 (reads an SC delta). Over every forward that runs, COUNTS[mode] accumulates its requests per
     mode (positions past the batch, at the idle slot, are not requests) and COUNTS[8 + mode] their rows (of ROWS, the
-    rest IDLE); COUNTS[16] counts the forwards (CTRL[6] a copy)."""
+    rest IDLE); COUNTS[16] counts the forwards (CTRL[6] a copy). FUSED (LANE layout in batched.py): LANE[6]
+    accumulates the lane rows held, LANE[12 + c] the active requests of canvas length class c (B, B1, B2, B3) in
+    forwards whose lanes they may claim."""
     _wait()
     j = tl.arange(0, NP)
     slot = tl.load(SLOTS + j, j < N, 0)
@@ -956,9 +1101,22 @@ def _control(MODE, STEP, SLOTS, BLOCKS, CTRL, COUNTS, N: tl.constexpr, NP: tl.co
     tl.store(COUNTS + k, tl.load(COUNTS + k) + tl.where(run & (k != IDLE), tl.sum(sel, 1), 0))
     used = tl.where(k == IDLE, ROWS - tl.sum(tl.where(mode == IDLE, 0, rows), 0), tl.sum(sel * rows[None, :], 1))
     tl.store(COUNTS + 8 + k, tl.load(COUNTS + 8 + k) + tl.where(run, used, 0))
+    if FUSED:
+        lanes, size = tl.load(LANE), tl.load(LANE + 1)
+        tl.store(LANE + 6, tl.load(LANE + 6) + tl.where(run, lanes * size, 0))
+        live = run & (lanes > 0) & ((mode == DENOISE) | (mode == COMMIT) | (mode == PREFILL))
+        _count_class(LANE + 12, live & (size >= B), rows, B)
+        _count_class(LANE + 13, live & (size >= B1), rows, B1)
+        _count_class(LANE + 14, live & (size >= B2), rows, B2)
+        _count_class(LANE + 15, live & (size >= B3), rows, B3)
     _release()
 
 
-def control(mode, step, slots, blocks, ctrl, counts, rows, head):
+def control(mode, step, slots, blocks, ctrl, counts, rows, head, *, lane=None, classes=()):
+    """`lane`: the lane state of a fused engine (with its canvas lengths `classes`), whose counters it keeps."""
     n = slots.numel()
-    _control[(1,)](mode, step, slots, blocks, ctrl, counts, n, triton.next_power_of_2(n), rows, head, **LAUNCH)
+    b, _ = _classes(classes, classes) if lane is not None else ((0,) * 4, ())
+    _control[(1,)](mode, step, slots, blocks, ctrl, counts, lane if lane is not None else ctrl, n,
+                   triton.next_power_of_2(n), rows, head, lane is not None, *b, **LAUNCH)
+
+

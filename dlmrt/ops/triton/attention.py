@@ -23,7 +23,7 @@ def _attention(Q, K, V, O, PO, PL, START, END, LEFT, SLOTS, INDEX, MODES, STATE,
     HAS_SLOTS: row r belongs to the request at slot SLOTS[r], at position START[slot] + INDEX[r] of the slot's arena
     K/V[slot] (S positions); a query tile's rows (BLOCK_M / group) belong to one request, which reads START / END /
     LEFT at its slot. MIXED (with HAS_SLOTS): per tile, causal (within WINDOW) if MODES[slot] is 1 or 2 (commit /
-    prefill rows), else the canvas's [LEFT, END).
+    prefill rows) or its rows sit before START (a commit lane: negative INDEX), else the canvas's [LEFT, END).
     HAS_STATE (with HAS_SLOTS): the slot's START / END / LEFT / MODES read at STATE[r] = (start, end, left, mode) of
     the tile's first row r instead, so the key range does not wait on the slot load."""
     _wait()
@@ -74,7 +74,7 @@ def _attention(Q, K, V, O, PO, PL, START, END, LEFT, SLOTS, INDEX, MODES, STATE,
         first = tl.maximum(first, start + q0 - (WINDOW - 1))
     if MIXED:
         mode = tl.load(MODES + at)
-        causal = (mode == 1) | (mode == 2)
+        causal = (mode == 1) | (mode == 2) | (q0 < 0)
         stop = tl.where(causal, tl.minimum(end, start + q1 + 1), end)
         first = tl.where(causal, 0, first)
         if WINDOW > 0:

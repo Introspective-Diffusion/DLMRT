@@ -26,7 +26,7 @@ Canvas lengths follow the load: before each launch the host asks the policy for 
 requests and sets it as every request's wanted length. A request keeps its rows until its current canvas is
 committed; if it then wants another length, it parks (SWITCH), which ends the launch, and the host gives it rows of
 the new length (committed context is ordinary causal KV, so nothing moves but its rows). Each canvas length has its
-stop rule (freeze_argmax for short canvases, the reference renoise rule for long ones).
+stop rule (freeze-argmax for short canvases, the stock renoise rule for long ones).
 
 The host steps in when a request finishes or parks: it reads the finished request's canvases, admits waiting
 requests (within the row budget `max_rows`) into the freed batch positions, moves the last requests into the gaps,
@@ -93,26 +93,62 @@ def buckets_for(max_batch):
 
 
 # FlashInfer's TRT-LLM MoE token buckets: row counts whose tactic the autotuner finds (in the last cache file it
-# loaded); nvfp4.keep restores the tactics of the others.
+# loaded); commit lanes add LANE_STEP-row rungs above 4096, whose own tactics nvfp4.keep restores.
 MOE_ROWS = [1 << k for k in range(9)] + list(range(512, 2048, 256)) + list(range(2048, 4096, 512)) + \
     [1 << k for k in range(12, 17)]
+LANE_STEP = 512
+# Lane claims per active request per forward before a run has measured any (freeze-argmax 32-canvases), weighted as
+# LANE_WEIGHT request-forwards of measurements.
+LANE_PRIOR, LANE_WEIGHT = 0.25, 64
+# Forward cost in rows of transformer forward (B200, ORL NVFP4 stage timings): a fixed part, and the LM head, decoder
+# and SC per request row.
+FORWARD_FIXED, HEAD_COST = 600, 0.7
 
 
-def row_buckets(blocks, max_batch, max_rows=None):
+def row_buckets(blocks, max_batch, max_rows=None, lanes=0):
     """Rows per forward the engine captures a loop for (and the expert kernels are tuned for): N x B for the batch
-    buckets N at one canvas length B; at several (or more rows than max_batch x B), the MoE token buckets from the
-    shortest length up to `max_rows` (default max_batch x the shortest length)."""
+    buckets N at one canvas length B; at several (or with `lanes` rows of commit lanes on top, or more rows than
+    max_batch x B), the MoE token buckets from the shortest length up to `max_rows` (default max_batch x the shortest
+    length). Lanes add the rungs (the MoE token buckets to 4096, then every LANE_STEP rows) that are multiples of the
+    shortest length, up to the first that holds `lanes` more rows, below `max_rows` too (request rows of 64-canvases
+    between 4096 and 8192)."""
     b0 = min(blocks)
     top = max_rows or max_batch * b0
-    if len(blocks) == 1 and top <= max_batch * b0:
+    if len(blocks) == 1 and not lanes and top <= max_batch * b0:
         return [n * b0 for n in buckets_for(max_batch)]
-    return sorted({r for r in MOE_ROWS if b0 <= r <= top} | {top})
+    out = {r for r in MOE_ROWS if b0 <= r <= top} | {top}
+    if lanes:
+        rungs = sorted({r for r in MOE_ROWS if r < 4096} | set(range(4096, top + lanes + LANE_STEP, LANE_STEP)))
+        total = next(r for r in rungs if r >= top + lanes)
+        out |= {r for r in rungs if b0 <= r <= total and r % b0 == 0}
+    return sorted(out)
+
+
+def lane_size(blocks, block=64):
+    """Rows per commit lane: the longest canvas length <= `block` (0: none, no lanes)."""
+    return max([b for b in blocks if b <= block], default=0)
+
+
+def head_totals(buckets, max_rows, max_batch, b0, cap=0.4, size=0):
+    """{head: totals}: the row buckets requests may fill (heads, <= max_rows) and, per head, the launch row counts
+    prebuilt for it, up to the first with room for ceil(cap x n) lanes of `size` rows at its most requests n."""
+    out = {}
+    for head in (r for r in buckets if r <= max_rows):
+        most = math.ceil(cap * min(max_batch, head // b0)) * size
+        top = next((r for r in buckets if r >= head + most), buckets[-1])
+        out[head] = [r for r in buckets if head <= r <= top]
+    return out
+
+
+def lane_rows(max_batch, b0, share=0.4, block=64):
+    """Rows of commit lanes an engine holds at most: share x max_batch lanes of `block` rows."""
+    return math.ceil(math.ceil(max_batch * share) * block / b0) * b0
 
 
 class LoadPolicy:
     """The canvas length of the next canvases for a batch of n requests: the first tier (most requests, length) with
     n <= most; the current tier is kept while n is within `slack` requests of its range. The default tiers follow the
-    measured B200 frontier (256 up to 2 requests, 128 up to 11, then 32 with the freeze_argmax rule)."""
+    measured B200 frontier (256 up to 2 requests, 128 up to 11, then 32 with the freeze-argmax rule)."""
 
     def __init__(self, tiers=((2, 256), (11, 128), (LIMIT, 32)), slack=1):
         self.tiers, self.slack, self.tier = tuple(tiers), slack, None
@@ -134,19 +170,34 @@ class LoadPolicy:
         return self.tiers[tier][1]
 
 
-def sizes(blocks, max_batch, max_rows=None, **_):
-    """(the batch's row budget, the row buckets) of an engine with these options (see BatchedGemmaEngine; the others do
-    not size it), from which its model is built."""
-    max_rows = max_rows or max(max_batch * min(blocks), max(blocks))
-    return max_rows, row_buckets(blocks, max_batch, max_rows)
+def sizes(blocks, max_batch, max_rows=None, *, fused=False, lane_cap=0.4, lane_min=8, lane_block=64, **_):
+    """(the batch's row budget, rows per commit lane (0: no lanes), the row buckets) of an engine with these options
+    (see BatchedGemmaEngine; the others do not size it), from which its model is built."""
+    b0 = min(blocks)
+    max_rows = max_rows or max(max_batch * b0, max(blocks))
+    size = lane_size(blocks, lane_block) if fused and max_batch >= lane_min else 0
+    lanes = lane_rows(max_batch, b0, lane_cap, size) if size else 0
+    return max_rows, size, row_buckets(blocks, max_batch, max_rows, lanes)
 
 
 class BatchedGemmaEngine:
-    def __init__(self, model, decoder=None, max_batch=8, *, blocks=None, stops=None, policy=None, max_rows=None):
+    def __init__(self, model, decoder=None, max_batch=8, *, blocks=None, stops=None, policy=None, max_rows=None,
+                 fused=False, lane_share=None, lane_cap=0.4, lane_min=8, lane_block=64):
         """`blocks`: the canvas lengths requests may use (one to four powers of two; default the checkpoint's
         canvas_length), `stops`: {length: GemmaDecode stop rule} (default the decoder's for every length), `policy`:
         n -> the canvas length for a batch of n requests (default the longest; see LoadPolicy), `max_rows`: the rows a
         batch may hold, which bounds admission (default max_batch x the shortest length, at least the longest).
+
+        `fused`: commit a stopped canvas in a commit lane, in the same forward as the next canvas's first round
+        (numerics differ from GemmaEngine's: other row counts). A launch of n >= `lane_min` requests at a canvas
+        length <= `lane_block` holds lanes of that length after the requests' rows, up to the row bucket of least
+        expected cost for the claims expected per forward (_lane_total; at most ceil(lane_cap x n) lanes unless more
+        lane commits are pending): the sum over the requests that may claim one of their canvas length's claim rate,
+        the share of its active requests whose canvas stops in a forward, `lane_share` (a number or {length: share})
+        or, by default, measured over the run (from LANE_PRIOR). Stopped canvases take lanes in request-position order; one
+        that finds none is committed in its own rows as without `fused`. The LM head, decoder and self-conditioning
+        skip the lanes. An engine that can hold no lane (max_batch < lane_min, or no canvas length <= lane_block)
+        runs as without `fused`.
 
         `model`: a GemmaModel at TP=1 built with slots >= max_batch + 1 and row_buckets = the row buckets of `sizes`
         for these options, max_rows >= the last of them (see `load`)."""
@@ -166,11 +217,20 @@ class BatchedGemmaEngine:
         if not set(getattr(self.policy, "blocks", ())) <= set(self.blocks):
             raise ValueError(f"the policy's canvas lengths {self.policy.blocks} are not all in {self.blocks}")
         self.max_batch = max_batch
-        self.max_rows, self.row_buckets = sizes(self.blocks, max_batch, max_rows)
+        self.lane_min, self.lane_block, self.lane_cap = lane_min, lane_block, lane_cap
+        self.max_rows, self.lane_size, self.row_buckets = sizes(
+            self.blocks, max_batch, max_rows, fused=fused, lane_cap=lane_cap, lane_min=lane_min, lane_block=lane_block)
+        self.fused = self.lane_size > 0
+        self.lane_share = lane_share if isinstance(lane_share, dict) or lane_share is None else \
+            {b: lane_share for b in self.blocks}
         if m.group is not None or m.slots < max_batch + 1 or m.max_rows < self.row_buckets[-1] or \
                 self.max_rows < self.blocks[0]:
             raise ValueError("BatchedGemmaEngine needs a TP=1 model with slots >= max_batch + 1 and max_rows >= the "
                              "engine's largest row bucket, and max_rows >= the longest canvas")
+        # Request rows fill a head bucket (whose rows run the LM head, decoder and SC); with lanes, a forward runs
+        # one of the head's totals.
+        self.totals = head_totals(self.row_buckets, self.max_rows, max_batch, b0, lane_cap, self.lane_size)
+        self.heads = list(self.totals)
         # A launch's rows are aligned to the largest of these that divides all its row counts (the shortest canvas in
         # it); from 64 rows on the sliding layers' attention takes its default query tiles (a forward graph per
         # alignment).
@@ -179,14 +239,15 @@ class BatchedGemmaEngine:
         dev = m.device
         rows, n_slots = self.row_buckets[-1], m.slots
         i32 = {"device": dev, "dtype": torch.int32}
-        # Rows: request p owns [offset[slot], offset[slot] + length[slot]) for slot = slots[p].
+        # Rows: request p owns [offset[slot], offset[slot] + length[slot]) for slot = slots[p]; commit lanes follow
+        # the head bucket. The LM head, decoder and SC buffers hold the largest head.
         self.tokens = torch.zeros(rows, device=dev, dtype=torch.int64)  # canvas / commit / prompt-chunk input
         self.canvas = torch.zeros(rows, device=dev, dtype=torch.int64)  # argmax canvas
-        self.argmax = torch.zeros(rows, device=dev, dtype=torch.int64)
-        self.sample = torch.zeros(rows, device=dev, dtype=torch.int64)
-        self.logits = torch.zeros(rows, m.vocab, device=dev, dtype=torch.bfloat16)
-        self.probs = torch.zeros(rows, m.vocab, device=dev, dtype=torch.bfloat16)
-        self.stats = torch.zeros(rows, 2, device=dev, dtype=torch.float32)
+        self.argmax = torch.zeros(self.heads[-1], device=dev, dtype=torch.int64)
+        self.sample = torch.zeros(self.heads[-1], device=dev, dtype=torch.int64)
+        self.logits = torch.zeros(self.heads[-1], m.vocab, device=dev, dtype=torch.bfloat16)
+        self.probs = torch.zeros(self.heads[-1], m.vocab, device=dev, dtype=torch.bfloat16)
+        self.stats = torch.zeros(self.heads[-1], 2, device=dev, dtype=torch.float32)
         self.h = torch.zeros(rows, c.hidden_size, device=dev, dtype=torch.bfloat16)
         self.out = torch.zeros(rows, c.hidden_size, device=dev, dtype=torch.bfloat16)  # the forward's final norm
         self.delta = torch.zeros(rows, c.hidden_size, device=dev, dtype=torch.bfloat16)  # SC delta of the next round
@@ -206,9 +267,15 @@ class BatchedGemmaEngine:
             torch.zeros(n_slots, **i32) for _ in range(7))
         self.temp, self.h_ref, self.t_prev = (torch.zeros(n_slots, device=dev, dtype=torch.float32) for _ in range(3))
         # WHILE control [run, forwards, finished, finish limit, denoising, conditioned, forward clock, canvas positions
-        # re-noised for NaN logits] and the slots' modes, read back in one copy after each launch.
-        self.readback = torch.zeros(8 + n_slots, **i32)
-        self.ctrl, self.mode = self.readback[:8], self.readback[8:]
+        # re-noised for NaN logits], the slots' modes and, from the 16-byte boundary after them, the commit lanes'
+        # state, read back in one copy after each launch. Commit lanes: [lanes, rows per lane, first lane row, lanes
+        # claimed after the last forward | lane commits, their rows, lane rows held x forwards, - | per canvas length
+        # class c (self.blocks order): canvases that waited for a lane (8 + c), active requests in forwards with lanes
+        # for them (12 + c)], then (slot, rows) per claimed lane; the first four set by the host per launch, the rest
+        # accumulated over a run.
+        self.lane_at = 8 + -(-n_slots // 4) * 4
+        self.readback = torch.zeros(self.lane_at + 16 + 2 * (rows // b0), **i32)
+        self.ctrl, self.mode, self.lane = self.readback[:8], self.readback[8:8 + n_slots], self.readback[self.lane_at:]
         self.mode.fill_(IDLE)
         self.prompt_len, self.max_new, self.canvases = (torch.zeros(n_slots, **i32) for _ in range(3))
         # [first row, rows (0: none), wanted canvas length] per slot, set by the host for each launch.
@@ -229,12 +296,16 @@ class BatchedGemmaEngine:
         self.slots = self.slots_host.to(dev)
         self.ctrl_host = torch.zeros(8, dtype=torch.int32).pin_memory()
         self.counts = torch.zeros(24, **i32)
+        # `wants`: per request position, a stopped canvas waiting for a commit lane (kernels._claim).
+        self.lane_host = torch.zeros(4, dtype=torch.int32).pin_memory()
+        self.lane_stats = [0] * 16
+        self.wants = torch.zeros(max_batch, **i32)
         self.trace = []  # per launch of the last run
         # The host writes its tables through numpy views: CPU tensor ops run on PyTorch's OpenMP pool, at a cost that
         # depends on the other processes on the node.
-        self.rowmap_np, self.layout_np, self.slots_np, self.ctrl_np, self.prompt_np, self.params_np = (
-            t.numpy() for t in (self.rowmap_host, self.layout_host, self.slots_host, self.ctrl_host, self.prompt_host,
-                                self.params_host))
+        self.rowmap_np, self.layout_np, self.slots_np, self.lane_np, self.ctrl_np, self.prompt_np, self.params_np = (
+            t.numpy() for t in (self.rowmap_host, self.layout_host, self.slots_host, self.lane_host, self.ctrl_host,
+                                self.prompt_host, self.params_host))
         with torch.cuda.device(dev):
             self._capture()
 
@@ -245,7 +316,7 @@ class BatchedGemmaEngine:
         positions."""
         opts = dict(options)
         blocks = tuple(opts.pop("blocks", None) or (GemmaConfig.load(path).block_size,))
-        _, buckets = sizes(blocks, max_batch, **opts)
+        _, _, buckets = sizes(blocks, max_batch, **opts)
         model = GemmaModel.load(path, max_seq_len, device=device, precision=precision, slots=max_batch + 1,
                                 max_rows=buckets[-1], row_buckets=buckets)
         return cls(model, decoder, max_batch, blocks=blocks, **opts)
@@ -256,12 +327,14 @@ class BatchedGemmaEngine:
         return min(self.max_batch, r // self.b0)
 
     def _requests(self, r):
-        """Per-request kernel arguments of row bucket r: positions -> slots, and the slots' rows."""
+        """Per-request kernel arguments of head bucket r: positions -> slots, and the slots' rows."""
         return dict(slots=self.slots[:self._positions(r)], offsets=self.offset, blocks=self.length,
                     classes=self.blocks)
 
     def _control(self, r, head):
-        gk.control(self.mode, self.step, self.slots[:self._positions(r)], self.length, self.ctrl, self.counts, r, head)
+        lanes = dict(lane=self.lane, classes=self.blocks) if self.fused else {}
+        gk.control(self.mode, self.step, self.slots[:self._positions(r)], self.length, self.ctrl, self.counts, r, head,
+                   **lanes)
 
     def _head(self, r):
         c = self.model.config
@@ -275,7 +348,7 @@ class BatchedGemmaEngine:
         m = self.model
         slots, index, state = self.row_slot[:r], self.row_index[:r], self.row_state[:r]
         gk.embed(self.tokens[:r], m.embedding, m.embed_scale, self.h[:r], m.config.rms_norm_eps, decoder=True,
-                 delta=self.delta[:r], modes=self.mode, slots=slots, step=self.step,
+                 delta=self.delta[:r], modes=self.mode, slots=slots, step=self.step, index=index if self.fused else None,
                  state=(self.start, self.end, self.leftpad, state))
         m.forward(self.h[:r], self.start, self.end, self.leftpad, causal=False, splits=1, slots=slots, index=index,
                   block=align, modes=self.mode, state=state, out=self.out[:r])
@@ -300,11 +373,19 @@ class BatchedGemmaEngine:
     def _advance(self, r):
         c = self.model.config
         q = self._requests(r)
+        if self.fused:
+            gk.release_lanes(self.lane, self.row_slot, self.row_index, self.idle, self.b0, self.row_buckets[-1])
         gk.advance(self.mode, self.params, self.tokens, self.canvas, self.accepted, self.start, self.end,
                    self.leftpad, self.step, self.remaining, self.seed, self.ordinal, q["slots"], self.offset,
                    self.length, self.want, self.prompt, self.prompt_len, self.max_new, self.token_out, self.step_out,
                    self.block_out, self.canvases, self.eos, self.ctrl, c.sliding_window, c.vocab_size, self.blocks,
-                   self.decoder.max_denoising_steps, clock=(self.counts, self.clock_out))
+                   self.decoder.max_denoising_steps, clock=(self.counts, self.clock_out),
+                   lanes=(self.lane, self.wants) if self.fused else None)
+        if self.fused:
+            gk.claim(self.mode, self.params, self.tokens, self.canvas, self.accepted, self.start, self.end,
+                     self.leftpad, self.step, self.remaining, self.seed, self.ordinal, q["slots"], self.offset,
+                     self.length, self.wants, self.lane, self.row_slot, self.row_index, c.sliding_window, c.vocab_size,
+                     self.blocks)
         self._control(r, head=False)
 
     def _self_condition(self, r):
@@ -320,7 +401,7 @@ class BatchedGemmaEngine:
         self.mode.fill_(IDLE)
         self.params.copy_(torch.tensor([0, -1, 0], dtype=torch.int32).expand_as(self.params))
         for t in (self.start, self.leftpad, self.step, self.remaining, self.ctrl, self.counts, self.tokens,
-                  self.layout):
+                  self.layout, self.lane, self.wants):
             t.zero_()
         self.end.fill_(self.b0)
         self.slots.fill_(self.idle)
@@ -342,29 +423,40 @@ class BatchedGemmaEngine:
             self.graphs[key] = graph
 
         self._reset()
+        # Per-request stages and the LM head / decoder / SC run over the head rows, the forward over all rows.
         parts = (("head", self._head), ("decode", self._decode), ("advance", self._advance),
                  ("sc", self._self_condition))
         with torch.cuda.stream(stream):
             for r in self.row_buckets:
-                for name, fn in parts:
-                    capture((name, r), lambda fn=fn, r=r: fn(r))
+                if r in self.totals:
+                    for name, fn in parts:
+                        capture((name, r), lambda fn=fn, r=r: fn(r))
                 for a in self.aligns:
                     if r % a == 0:
                         capture(("forward", r, a), lambda r=r, a=a: self._forward(r, a))
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
         self._reset()
-        ctrl = self.ctrl.data_ptr()
-        denoising, conditioned = ctrl + 16, ctrl + 20
-        raw = {key: g.raw_cuda_graph() for key, g in self.graphs.items()}
-        self.loops = {(r, a): block_graph().StagedLoopGraph(
-            raw[("head", r)], [(raw[("forward", r, a)], 0), (raw[("decode", r)], denoising), (raw[("advance", r)], 0),
-                               (raw[("sc", r)], conditioned)], ctrl, ctrl + 4, LIMIT)
-            for r in self.row_buckets for a in self.aligns if r % a == 0}
+        self.loops = {}
+        for head, totals in self.totals.items():
+            for rows in totals:
+                for a in self.aligns:
+                    if head % a == 0 and rows % a == 0:
+                        self._loop(rows, head, a)
 
-    def _loop(self, rows, align):
-        """The launch graph of `rows` rows aligned to `align`."""
-        return self.loops[rows, align]
+    def _loop(self, rows, head, align):
+        """The launch graph of `rows` rows aligned to `align`, whose first `head` rows (the requests' own rows; the
+        rest are commit lanes) run the LM head, decoder and self-conditioning (built on first use: the head's totals
+        are prebuilt, others serve pending lane commits beyond them)."""
+        if (rows, head, align) not in self.loops:
+            ctrl = self.ctrl.data_ptr()
+            denoising, conditioned = ctrl + 16, ctrl + 20
+            raw = {key: g.raw_cuda_graph() for key, g in self.graphs.items()}
+            self.loops[rows, head, align] = block_graph().StagedLoopGraph(
+                raw[("head", head)], [(raw[("forward", rows, align)], 0), (raw[("decode", head)], denoising),
+                                      (raw[("advance", head)], 0), (raw[("sc", head)], conditioned)], ctrl, ctrl + 4,
+                LIMIT)
+        return self.loops[rows, head, align]
 
     # --- host loop ---
 
@@ -384,33 +476,89 @@ class BatchedGemmaEngine:
         self.max_new[slot] = max_new_tokens
         self.mode[slot] = ADMIT
 
-    def _move(self, moves):
-        """Carried rows (src, dst, rows) to their new place."""
-        def rows(k):
-            return torch.from_numpy(np.concatenate([np.arange(m[k], m[k] + m[2]) for m in moves])).to(self.model.device)
+    def _move(self, moves, lanes=()):
+        """Carried rows (src, dst, rows) to their new place, and the tokens of lane commits (src, dst, rows)."""
+        def rows(ms, k):
+            return torch.from_numpy(np.concatenate([np.arange(m[k], m[k] + m[2]) for m in ms])).to(self.model.device)
 
-        src, dst = rows(0), rows(1)
-        for t in self.carried:
-            t[dst] = t[src]
+        every = list(moves) + list(lanes)
+        self.tokens[rows(every, 1)] = self.tokens[rows(every, 0)]
+        if moves:
+            src, dst = rows(moves, 0), rows(moves, 1)
+            for t in self.carried[1:]:
+                t[dst] = t[src]
 
     def _bucket(self, rows):
-        return next(b for b in self.row_buckets if b >= rows)
+        return next(b for b in self.heads if b >= rows)
 
-    def _layout(self, batch, want):
-        """Rows in batch order; moves the rows that changed place; host tables of the launch. Returns (the requests'
-        rows, launch rows)."""
+    def _claims(self, batch, want, size):
+        """Lane claims expected per forward: the claim rate of each request that may take a lane of `size` rows."""
+        if self.lane_share is not None:
+            rate = self.lane_share
+        else:
+            s = self.lane_stats
+            rate = {b: (s[8 + c] + LANE_PRIOR * LANE_WEIGHT) / (s[12 + c] + LANE_WEIGHT)
+                    for c, b in enumerate(self.blocks)}
+        return sum(rate.get(r.block, 0.0) for r in batch if r.block <= size and want[r.slot] == r.block)
+
+    def _lane_total(self, head, size, claims, pending, n):
+        """The launch's rows for `head` rows of n requests and lanes of `size` rows: among the head's totals with room
+        for the `pending` lane commits (else the first bucket that holds them), the one of least expected cost per
+        forward in rows of transformer forward: its lane rows, plus a canvas slot of the forward (FORWARD_FIXED and
+        HEAD_COST: the forward's cost over n) per claim past its lanes, which commits in its own rows next; claims
+        Poisson with mean `claims`."""
+        fits = [t for t in self.totals[head] if (t - head) // size >= pending]
+        if not fits:
+            return next(b for b in self.row_buckets if b >= head + pending * size)
+        slot = (FORWARD_FIXED + (1 + HEAD_COST) * head) / max(1, n)
+        most = (fits[-1] - head) // size
+        p, below = math.exp(-claims), [0.0]  # below[k] = P(claims < k)
+        for k in range(most + 1):
+            below.append(below[-1] + p)
+            p *= claims / (k + 1)
+
+        def cost(t):
+            k = (t - head) // size
+            past = claims * (1 - below[max(k - 1, 0)]) - k * (1 - below[k])  # E[max(claims - k, 0)]
+            return t - head + max(past, 0.0) * slot
+
+        return min(fits, key=lambda t: (cost(t), t))
+
+    def _layout(self, batch, want, n, target, claimed):
+        """Rows in batch order and, with `fused`, commit lanes after them (from the head bucket on), the lane commits
+        `claimed` [(slot, rows, first row)] in the previous launch's last forward first; moves the rows that changed
+        place; host tables of the launch. Returns (the requests' rows, head rows, launch rows, expected claims)."""
         offset, moves = 0, []
         for r in batch:
             if 0 <= r.offset != offset:
                 moves.append((r.offset, offset, r.block))
             r.offset = offset
             offset += r.block
-        bucket = self._bucket(offset)
-        if moves:
-            self._move(moves)
+        head = total = self._bucket(offset)
+        size, lanes, claims = 0, 0, 0.0
+        if self.fused:
+            size = target if target <= self.lane_block and n >= self.lane_min else 0
+            claims = self._claims(batch, want, size) if size else 0.0
+            size = max([size] + [b for _, b, _ in claimed])
+            if size:
+                total = self._lane_total(head, size, claims, len(claimed), n)
+                lanes = (total - head) // size
+        placed = [(src, head + j * size, b) for j, (_, b, src) in enumerate(claimed)]
+        shifted = [p for p in placed if p[0] != p[1]]
+        if moves or shifted:
+            self._move(moves, shifted)
         rm = self.rowmap_np
-        rm[0, offset:bucket] = self.idle
-        rm[1, offset:bucket] = self.pad_index[offset:bucket]
+        rm[0, offset:total] = self.idle
+        rm[1, offset:total] = self.pad_index[offset:total]
+        if claimed:
+            k = len(claimed)
+            slot, b = np.array([(s, b) for s, b, _ in claimed], dtype=np.int32).T[:, :, None]
+            i = self.arange_host[:size]
+            on = i < b
+            rm[0, head:head + k * size] = np.where(on, slot, self.idle).ravel()
+            rm[1, head:head + k * size] = np.where(on, i - b, self.pad_index[head:head + k * size].reshape(k, size)
+                                                   ).ravel()
+        self.lane_np[:] = lanes, size, head, len(claimed)
         slots = np.array([r.slot for r in batch], dtype=np.int32)
         blocks = np.array([r.block for r in batch], dtype=np.int32)
         firsts = np.array([r.offset for r in batch], dtype=np.int32)
@@ -423,7 +571,7 @@ class BatchedGemmaEngine:
         rm[1, :offset] = self.arange_host[:offset] - np.repeat(firsts, blocks)
         self.slots_np[:] = self.idle
         self.slots_np[:len(batch)] = slots
-        return offset, bucket
+        return offset, head, total, claims
 
     def _outputs(self, slots):
         """Per slot (host arrays, one copy): emitted tokens, then per canvas its length, rounds and forward clock, then
@@ -464,10 +612,12 @@ class BatchedGemmaEngine:
         stream = torch.cuda.current_stream().cuda_stream
         pending = list(enumerate(prompts))[::-1]
         free = list(range(self.max_batch))[::-1]
-        batch, results, taken, modes, clock = [], [None] * len(prompts), 0, None, 0
+        batch, results, taken, modes, claimed, clock = [], [None] * len(prompts), 0, None, [], 0
         self.trace = []
         started = time.perf_counter()
         self.counts.zero_()
+        self.lane.zero_()
+        self.lane_stats = [0] * 16
         if hasattr(self.policy, "reset"):
             self.policy.reset()
 
@@ -524,25 +674,34 @@ class BatchedGemmaEngine:
                     alive, used = alive + 1, used + batch[-1].block
                 for r in batch:
                     want.setdefault(r.slot, target)
-                rows, bucket = self._layout(batch, want)
+                rows, head, bucket, claims = self._layout(batch, want, alive, target, claimed)
                 self.rowmap[:, :bucket].copy_(self.rowmap_host[:, :bucket], non_blocking=True)
                 self.layout.copy_(self.layout_host, non_blocking=True)
                 self.slots.copy_(self.slots_host, non_blocking=True)
+                lanes, size = self.lane_np[:2].tolist()
+                if self.fused:
+                    self.lane[:4].copy_(self.lane_host, non_blocking=True)
                 self.ctrl_np[3] = 1
                 self.ctrl.copy_(self.ctrl_host, non_blocking=True)
                 launched = time.perf_counter()
-                # Every request's rows start at a multiple of the alignment.
-                align = max(a for a in self.aligns if all(k % a == 0 for k in [r.block for r in batch] + [bucket]))
-                self._loop(bucket, align).replay(stream)
-                back = self.readback.tolist()
+                # Every request's rows, the lanes and the head start at a multiple of the alignment.
+                align = max(a for a in self.aligns if all(
+                    k % a == 0 for k in [r.block for r in batch] + [head, bucket] + ([size] if lanes else [])))
+                self._loop(bucket, head, align).replay(stream)
+                back = self.readback[:self.lane_at + 16 + 2 * lanes if self.fused else 8 + self.mode.numel()].tolist()
                 now = time.perf_counter()
                 ctrl, modes = back[:8], back[8:]
                 at, clock = clock, ctrl[6]
+                if self.fused:
+                    lane = back[self.lane_at:]
+                    self.lane_stats = lane[:16]
+                    claimed = [(lane[16 + 2 * j], lane[17 + 2 * j], lane[2] + j * lane[1]) for j in range(lane[3])]
                 mix = {}
                 for r in batch:
                     mix[r.block] = mix.get(r.block, 0) + 1
-                self.trace.append({"n": len(batch), "bucket": bucket, "align": align, "rows": rows, "mix": mix,
-                                   "target": target, "forwards": ctrl[1], "finished": ctrl[2], "nan": ctrl[7],
+                self.trace.append({"n": len(batch), "bucket": bucket, "head": head, "align": align, "rows": rows,
+                                   "mix": mix, "target": target, "lanes": lanes, "lane_rows": size,
+                                   "claims": claims, "forwards": ctrl[1], "finished": ctrl[2], "nan": ctrl[7],
                                    "graph_s": now - launched, "t0": launched - started, "clock": at})
                 if ctrl[7]:
                     warnings.warn(f"launch {len(self.trace)}: {ctrl[7]} canvas positions had NaN logits (re-noised; "
@@ -562,16 +721,26 @@ class BatchedGemmaEngine:
 
     def mode_shares(self):
         """Share of requests x forwards per mode over the last run (each request once, whatever its rows; padding
-        appears in row_shares only)."""
-        counts = self.counts.tolist()[:len(MODES)]
+        appears in row_shares only); with `fused`, commits in a lane count as requests of their own ("lane")."""
+        counts, names = self.counts.tolist()[:len(MODES)], MODES
+        if self.fused:
+            counts, names = counts + [self.lane_commits()], names + ("lane",)
         total = max(1, sum(counts))
-        return {name: c / total for name, c in zip(MODES, counts)}
+        return {name: c / total for name, c in zip(names, counts)}
 
     def row_shares(self):
-        """Share of rows x forwards per mode over the last run (padding as idle)."""
-        counts = self.counts.tolist()[8:8 + len(MODES)]
+        """Share of rows x forwards per mode over the last run (padding as idle); with `fused`, lane rows claimed
+        ("lane") and held unclaimed ("spare")."""
+        counts, names = self.counts.tolist()[8:8 + len(MODES)], MODES
+        if self.fused:
+            held, claimed = self.lane[5:7].tolist()[::-1]
+            counts, names = counts + [claimed, held - claimed], names + ("lane", "spare")
         total = max(1, sum(counts))
-        return {name: c / total for name, c in zip(MODES, counts)}
+        return {name: c / total for name, c in zip(names, counts)}
+
+    def lane_commits(self):
+        """Canvases committed in a lane over the last run (`fused`)."""
+        return int(self.lane[4])
 
     def first_canvas_s(self, r):
         """Seconds from the start of the launch that admitted `r` (a result of the last run) to the end of its first

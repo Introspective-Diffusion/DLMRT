@@ -1,7 +1,7 @@
 """DiffusionGemma's batched kernels (batched.py) against the single-request kernels, on synthetic data (no model): every
 per-row and per-request kernel run over a ragged batch (requests of different canvas lengths at row offsets, in
-different stages) must give each request bit for bit what the single-request kernel gives it alone;
-the stage kernels (admit, advance, control) move each request as batched.py describes."""
+different stages, and a commit lane) must give each request bit for bit what the single-request kernel gives it alone;
+the stage kernels (admit, advance, claim, control) move each request as batched.py describes."""
 
 import types
 
@@ -19,6 +19,7 @@ BLOCKS = (256, 128, 64, 32)
 # see none of their query tile's first key tile (with one key split).
 REQS = [(2, 64, 700, DENOISE), (5, 32, 1300, DENOISE), (1, 128, 300, DENOISE), (3, 32, 2000, COMMIT),
         (6, 32, 1063, COMMIT)]
+LANE = 64  # then a 64-row commit lane: slot 2's previous canvas, at indices -64..-1
 
 
 @pytest.fixture(autouse=True)
@@ -32,19 +33,21 @@ def batch():
     for _, b, _, _ in REQS:
         offsets.append(o)
         o += b
-    own = rows = o
+    own, rows = o, o + LANE
     row_slot, row_index = torch.full((rows,), IDLE, **i32), torch.arange(rows, **i32) % 32
     for (slot, b, _, _), off in zip(REQS, offsets):
         row_slot[off:off + b], row_index[off:off + b] = slot, torch.arange(b, **i32)
+    row_slot[own:], row_index[own:] = REQS[0][0], torch.arange(LANE, **i32) - LANE
     start, end, left, modes = (torch.zeros(8, **i32) for _ in range(4))
     modes.fill_(IDLE_MODE)
     end[IDLE] = 32
     for slot, b, s, mode in REQS:
         start[slot], end[slot], left[slot], modes[slot] = s, s + b, max(0, s - (W - 1)), mode
     state = torch.stack([t[row_slot.long()] for t in (start, end, left, modes)], 1).contiguous()
+    lane = (REQS[0][0], LANE, REQS[0][2] - LANE, COMMIT)
     return types.SimpleNamespace(offsets=offsets, own=own, rows=rows, row_slot=row_slot, row_index=row_index,
                                  start=start, end=end, left=left, modes=modes, state=state,
-                                 segments=list(zip(REQS, offsets)))
+                                 segments=list(zip(REQS, offsets)) + [(lane, own)])
 
 
 def one(t, slot):
@@ -53,8 +56,8 @@ def one(t, slot):
 
 @pytest.mark.parametrize("sliding", [True, False])
 def test_attention_slots(batch, sliding):
-    """Canvas rows over [left, end), causal rows (commit) within the window, each over its slot's arena; with one
-    key split, as batched forwards of >= 512 rows run."""
+    """Canvas rows over [left, end), causal rows (commit, lane) within the window, each over its slot's arena; with
+    one key split, as batched forwards of >= 512 rows run."""
     from dlmrt.ops.triton.attention import attention
 
     hq, hk, d, window, bm, warps = (16, 8, 256, W, 64, 4) if sliding else (16, 2, 512, 0, 128, 8)
@@ -80,7 +83,7 @@ def test_attention_slots(batch, sliding):
 
 
 def test_qkv_rope_slots(batch):
-    """Q, and K/V at start[slot] + index of each row's arena."""
+    """Q, and K/V at start[slot] + index of each row's arena (a lane's rows before its slot's start)."""
     from dlmrt.models.diffusion_gemma import kernels as gk
 
     hq, hk, d = 16, 8, 256
@@ -228,8 +231,8 @@ def test_decide_nan_rows_slots(stop_rule):
 
 
 def test_embed_slots(batch):
-    """The decoder path for denoising rows (the SC delta from round 1 on), the plain one for commit rows; the rows'
-    slot state gathered on the way."""
+    """The decoder path for denoising rows (the SC delta from round 1 on), the plain one for commit and lane rows; the
+    rows' slot state gathered on the way."""
     from dlmrt.models.diffusion_gemma import kernels as gk
 
     h, rows = 2816, batch.rows
@@ -241,7 +244,7 @@ def test_embed_slots(batch):
     out = torch.empty(rows, h, device=dev, dtype=torch.bfloat16)
     gathered = torch.zeros(rows, 4, **i32)
     gk.embed(ids, table, 53.0, out, 1e-6, decoder=True, delta=delta, modes=batch.modes, slots=batch.row_slot, step=step,
-             state=(batch.start, batch.end, batch.left, gathered))
+             index=batch.row_index, state=(batch.start, batch.end, batch.left, gathered))
     assert torch.equal(gathered, batch.state)
     for (slot, b, _, mode), off in batch.segments:
         h1 = torch.empty(b, h, device=dev, dtype=torch.bfloat16)
@@ -268,7 +271,8 @@ def stage_state(n_slots=8, rows=1024, seq=4608):
         step_out=torch.zeros(n_slots, 160, **i32), block_out=torch.zeros(n_slots, 160, **i32),
         clock_out=torch.zeros(n_slots, 160, **i32), canvases=torch.zeros(n_slots, **i32),
         eos=torch.tensor([1, 106], device=dev), ctrl=torch.tensor([0, 0, 0, 100, 0, 0, 0, 0], **i32),
-        counts=torch.zeros(24, **i32))
+        counts=torch.zeros(24, **i32), lane=torch.zeros(16 + 2 * (rows // 32), **i32), wants=torch.zeros(8, **i32),
+        row_slot=torch.full((rows,), IDLE, **i32), row_index=torch.arange(rows, **i32) % 32)
 
 
 def place(t, layout):
@@ -276,16 +280,23 @@ def place(t, layout):
     o = 0
     for p, (s, b, w) in enumerate(layout):
         t.slots[p], t.offsets[s], t.lengths[s], t.want[s] = s, o, b, w
+        t.row_slot[o:o + b], t.row_index[o:o + b] = s, torch.arange(b, **i32)
         o += b
     return o
 
 
-def advance(t):
+def advance(t, fused=False):
     from dlmrt.models.diffusion_gemma import kernels as gk
 
+    if fused:
+        gk.release_lanes(t.lane, t.row_slot, t.row_index, IDLE, 32, t.row_slot.numel())
     gk.advance(t.mode, t.P, t.tokens, t.canvas, t.accepted, t.start, t.end, t.left, t.step, t.remaining, t.seed,
                t.ordinal, t.slots, t.offsets, t.lengths, t.want, t.prompt, t.plen, t.max_new, t.token_out, t.step_out,
-               t.block_out, t.canvases, t.eos, t.ctrl, W, V, BLOCKS, 48, clock=(t.counts, t.clock_out))
+               t.block_out, t.canvases, t.eos, t.ctrl, W, V, BLOCKS, 48, clock=(t.counts, t.clock_out),
+               lanes=(t.lane, t.wants) if fused else None)
+    if fused:
+        gk.claim(t.mode, t.P, t.tokens, t.canvas, t.accepted, t.start, t.end, t.left, t.step, t.remaining, t.seed,
+                 t.ordinal, t.slots, t.offsets, t.lengths, t.wants, t.lane, t.row_slot, t.row_index, W, V, BLOCKS)
     torch.cuda.synchronize()
 
 
@@ -346,3 +357,53 @@ def test_admit_and_control():
     gk.control(t.mode, t.step, t.slots, t.lengths, t.ctrl, t.counts, rows, False)
     torch.cuda.synchronize()
     assert t.ctrl[0] == 0  # the finish limit reached
+
+
+def test_claim_lanes():
+    """Fused: stopped canvases of lane length take the launch's lanes in position order (their tokens and row map in
+    the lane, the next canvas begun); the rest, longer canvases and requests that want another length commit in their
+    rows; the lane counters; bit-identical over repeats."""
+    from dlmrt.models.diffusion_gemma import kernels as gk
+
+    layout = [(3, 64, 64), (0, 32, 32), (5, 32, 32), (2, 64, 64), (6, 32, 64), (1, 128, 128), (4, 32, 32)]
+    size, lanes = 64, 3
+
+    def run(fused=True, count=lanes):
+        torch.manual_seed(3)
+        t = stage_state()
+        own = place(t, layout)
+        t.mode[[s for s, _, _ in layout]] = DENOISE
+        t.P[:, 0], t.P[:, 1], t.P[:, 2] = 1000 + 100 * torch.arange(8, **i32), 2, 77
+        t.canvas[int(t.offsets[4]) + 5] = 106
+        t.lane[:3] = torch.tensor([count, size, own], **i32)
+        advance(t, fused)
+        if fused:
+            gk.control(t.mode, t.step, t.slots, t.lengths, t.ctrl, t.counts, own, False, lane=t.lane, classes=BLOCKS)
+            torch.cuda.synchronize()
+        return t, own
+
+    t, own = run()
+    torch.manual_seed(3)
+    c0 = stage_state().canvas
+    for j, s in enumerate((3, 0, 5)):  # the first three waiting canvases in position order
+        o, b, first = int(t.offsets[s]), int(t.lengths[s]), own + j * size
+        assert torch.equal(t.tokens[first:first + b], c0[o:o + b])
+        assert t.row_slot[first:first + b].tolist() == [s] * b and t.row_slot[first + b:first + size].tolist() == \
+            [IDLE] * (size - b)
+        assert t.row_index[first:first + b].tolist() == list(range(-b, 0)) and t.lane[16 + 2 * j:18 + 2 * j].tolist() \
+            == [s, b]
+        assert t.mode[s] == DENOISE and t.P[s, :2].tolist() == [1000 + 100 * s + b, 3] and t.step[s] == 0
+    for s in (2, 6, 1):  # no lane left, wants another length, longer than a lane
+        o, b = int(t.offsets[s]), int(t.lengths[s])
+        assert t.mode[s] == COMMIT and torch.equal(t.tokens[o:o + b], c0[o:o + b])
+    assert t.mode[4] == DONE and t.ctrl[2] == 1
+    assert t.lane[3:6].tolist() == [3, 3, 128] and t.lane[8:12].tolist() == [0, 0, 2, 2]
+    assert t.lane[6] == lanes * size and t.lane[12:16].tolist() == [0, 0, 2, 3]
+    assert t.wants.tolist() == [1, 1, 1, 1, 0, 0, 0, 0]
+    for _ in range(20):
+        again, _ = run()
+        assert all(torch.equal(getattr(again, k), getattr(t, k)) for k in vars(t))
+    plain = run(fused=False)[0]
+    for name, other in (("without lanes", plain), ("no lane in the launch", run(count=0)[0])):
+        assert other.mode[[s for s, _, _ in layout]].tolist() == [1, 1, 1, 1, 1, 1, 3], name
+        assert torch.equal(other.tokens[:own], plain.tokens[:own]), name

@@ -1,7 +1,7 @@
 """BatchedGemmaEngine on a checkpoint (DLMRT_DG_CHECKPOINT, one GPU, ~40 GB). One request at a time it emits
 GemmaEngine's tokens and denoise steps: 256-row canvases under the reference stop rule, 32-row canvases under
-freeze_argmax, and the load-adaptive 256 / 128 / 32 engine (256 for one request). A small batched run that switches
-canvas lengths finishes every request with tokens in the vocabulary and no NaN logits, and repeats token for token.
+freeze_argmax, and the load-adaptive 256 / 128 / 32 engine (256 for one request). A small batched run with commit lanes
+finishes every request with tokens in the vocabulary and no NaN logits, and repeats token for token.
 """
 
 import os
@@ -30,17 +30,18 @@ def prompts():
 
 
 def batched_options():
-    """The small batched run: 256-row canvases for up to two requests, then 32-row ones."""
+    """The small batched run: 256-row canvases for up to two requests, then 32-row ones with commit lanes."""
     from dlmrt.models.diffusion_gemma.batched import LIMIT, LoadPolicy
 
-    return dict(blocks=(256, 32), stops={32: "freeze_argmax"}, policy=LoadPolicy(((2, 256), (LIMIT, 32))))
+    return dict(blocks=(256, 32), stops={32: "freeze_argmax"}, policy=LoadPolicy(((2, 256), (LIMIT, 32))),
+                fused=True, lane_min=2)
 
 
 def model(canvas_length, max_batch, **options):
     from dlmrt.models.diffusion_gemma import GemmaModel
     from dlmrt.models.diffusion_gemma.batched import sizes
 
-    _, buckets = sizes(options.pop("blocks", (canvas_length,)), max_batch, **options)
+    _, _, buckets = sizes(options.pop("blocks", (canvas_length,)), max_batch, **options)
     return GemmaModel.load(CKPT, SEQ, canvas_length=canvas_length, slots=max_batch + 1, max_rows=buckets[-1],
                            row_buckets=buckets)
 
@@ -104,7 +105,7 @@ def test_batched_run(m256, prompts):
     vocab = m256.config.vocab_size
     assert all(r is not None and 0 < len(r.token_ids) <= MAX_NEW for r in first)
     assert all(0 <= t < vocab for r in first for t in r.token_ids)
-    assert engine.nan_positions() == 0
+    assert engine.nan_positions() == 0 and engine.lane_commits() > 0
     assert 32 in {b for r in first for b in r.blocks}
     again = engine.run(many, MAX_NEW, concurrency=4)
     assert [(r.token_ids, r.denoise_steps, r.blocks) for r in again] == \

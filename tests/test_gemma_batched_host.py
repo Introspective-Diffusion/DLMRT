@@ -1,16 +1,20 @@
 """BatchedGemmaEngine's host loop (run, _layout, _move, _outputs, _collect) on CPU tensors against a Python model of the
-device side of a launch (admit, advance, control), without a GPU or a model.
+device side of a launch (admit, advance, claim, control), without a GPU or a model.
 
-Checked at every forward: each request's rows are contiguous, disjoint, inside the launch's bucket and aligned to the
+Checked at every forward: each request's rows are contiguous, disjoint, inside the head bucket and aligned to the
 launch's alignment; the row maps match the layout and rows past the batch map to the idle slot; the rows a request
 carries between forwards (marked with its slot) followed it through every move; the batch stays within max_rows.
-Every request's canvases cover its tokens, and two runs with the same seed are identical.
+With commit lanes: they start at the head bucket and the launch holds them; lane commits claimed in a launch's last
+forward reach the next launch's lanes with their tokens and row maps; the launch's rows are one of the head's
+prebuilt totals unless pending lane commits need more. Every request's canvases cover its tokens, and two runs with
+the same seed are identical.
 """
 
 import contextlib
 import random
 import types
 
+import numpy as np
 import pytest
 import torch
 
@@ -27,33 +31,47 @@ class Device:
     def __init__(self, e, rng):
         self.e, self.rng = e, rng
         self.rounds, self.pos, self.emitted = {}, {}, {}
-        self.forwards = 0
+        self.forwards = self.lane_commits = 0
 
     @staticmethod
     def marker(s):
         return 1000 + s
 
-    def check(self, bucket):
+    def check(self, bucket, head):
         e = self.e
-        seen = torch.zeros(bucket, dtype=torch.bool)
+        if e.fused:
+            lanes, size, first, claimed = (int(v) for v in e.lane[:4])
+            assert first == head and head + lanes * size <= bucket and claimed <= lanes
+            for j in range(claimed):
+                s, n = int(e.lane[16 + 2 * j]), int(e.lane[17 + 2 * j])
+                o = first + j * size
+                assert (e.row_slot[o:o + n] == s).all() and (e.row_index[o:o + n] == torch.arange(n) - n).all()
+                assert (e.tokens[o:o + n] == self.marker(s) + 100000).all(), f"slot {s}: lane commit lost"
+                assert (e.row_slot[o + n:o + size] == e.idle).all()
+            assert (e.row_slot[first + claimed * size:bucket] == e.idle).all()
+        seen = torch.zeros(head, dtype=torch.bool)
         used = 0
-        for p in range(e._positions(bucket)):
+        for p in range(e._positions(head)):
             s = int(e.slots[p])
             if s == e.idle:
                 continue
             o, n = int(e.offset[s]), int(e.length[s])
-            assert n in e.blocks and o % e.b0 == 0 and o + n <= bucket and not seen[o:o + n].any(), (s, o, n, bucket)
+            assert n in e.blocks and o % e.b0 == 0 and o + n <= head and not seen[o:o + n].any(), (s, o, n, head)
             seen[o:o + n] = True
             used += n
             assert (e.row_slot[o:o + n] == s).all() and (e.row_index[o:o + n] == torch.arange(n)).all()
             if int(e.mode[s]) in (DENOISE, COMMIT, PREFILL):
                 assert (e.tokens[o:o + n] == self.marker(s)).all(), f"slot {s}: carried rows lost"
         assert used <= e.max_rows
-        assert (e.row_slot[:bucket][~seen] == e.idle).all()
+        assert (e.row_slot[:head][~seen] == e.idle).all()
 
-    def replay(self, bucket):
+    def replay(self, bucket, head):
         e = self.e
-        slots = [int(s) for s in e.slots[:e._positions(bucket)] if int(s) != e.idle]
+        if e.fused:
+            assert bucket in e.totals[head] or int(e.lane[3]) > (max(e.totals[head]) - head) // max(1, int(e.lane[1]))
+        else:
+            assert bucket == head
+        slots = [int(s) for s in e.slots[:e._positions(head)] if int(s) != e.idle]
         for s in slots:  # admit
             o, n = int(e.offset[s]), int(e.length[s])
             if int(e.mode[s]) == ADMIT:
@@ -63,10 +81,16 @@ class Device:
             elif int(e.mode[s]) == SWITCH:
                 self.begin(s, n)
         finished = 0
+        self.control(slots)
         while finished == 0 and any(int(e.mode[s]) in (DENOISE, COMMIT, PREFILL) for s in slots):
-            self.check(bucket)
+            self.check(bucket, head)
             self.forwards += 1
             e.ctrl[1] += 1
+            if e.fused:  # release_lanes
+                lanes, size, first = (int(v) for v in e.lane[:3])
+                e.row_slot[first:first + lanes * size] = e.idle
+                e.lane[3] = 0
+            waiting = []
             for s in slots:  # advance
                 n, mode = int(e.length[s]), int(e.mode[s])
                 if mode == DENOISE:
@@ -82,6 +106,8 @@ class Device:
                                 e.token_out[s, self.emitted[s] - 1] = EOS
                             e.mode[s], e.canvases[s] = DONE, k + 1
                             finished += 1
+                        elif e.fused and int(e.want[s]) == n and int(e.lane[0]) > 0 and int(e.lane[1]) >= n:
+                            waiting.append(s)
                         else:
                             e.mode[s] = COMMIT
                 elif mode == COMMIT:
@@ -92,9 +118,39 @@ class Device:
                     if self.pos[s] >= int(e.prompt_len[s]):
                         e.params[s, 1] = 0
                         finished += self.next_canvas(s, n)
+            for j, s in enumerate(waiting):  # claim, in position order
+                n = int(e.length[s])
+                e.lane[8 + e.blocks.index(n)] += 1
+                if j < int(e.lane[0]):
+                    first = int(e.lane[2]) + j * int(e.lane[1])
+                    e.tokens[first:first + n] = self.marker(s) + 100000
+                    e.row_slot[first:first + n], e.row_index[first:first + n] = s, torch.arange(n) - n
+                    e.lane[16 + 2 * j], e.lane[17 + 2 * j] = s, n
+                    e.lane[3] += 1
+                    e.lane[4] += 1
+                    e.lane[5] += n
+                    e.params[s, 1] += 1
+                    self.lane_commits += 1
+                    self.begin(s, n)
+                else:
+                    e.mode[s] = COMMIT
             e.counts[16] += 1
             e.ctrl[6] = e.counts[16]
+            if finished == 0:
+                self.control(slots)
         e.ctrl[2] = finished
+
+    def control(self, slots):
+        """kernels._control's lane counters for the next forward."""
+        e = self.e
+        if not e.fused:
+            return
+        lanes, size = int(e.lane[0]), int(e.lane[1])
+        e.lane[6] += lanes * size
+        for s in slots:
+            n = int(e.length[s])
+            if lanes > 0 and size >= n and n in e.blocks and int(e.mode[s]) in (DENOISE, COMMIT, PREFILL):
+                e.lane[12 + e.blocks.index(n)] += 1
 
     def next_canvas(self, s, n):
         if int(self.e.want[s]) == n:
@@ -129,23 +185,25 @@ def host(monkeypatch):
     torch.set_num_threads(threads)
 
 
-def trial(seed, blocks, max_batch, max_rows, concurrency, count):
+def trial(seed, blocks, max_batch, max_rows, concurrency, count, fused=False, lane_share=None):
     rng = random.Random(seed)
     tiers = tuple((n, b) for n, b in ((2, 256), (11, 128), (40, 64), (batched.LIMIT, 32)) if b in blocks)
     policy = batched.LoadPolicy(tiers) if len(blocks) > 1 else None
-    _, buckets = batched.sizes(blocks, max_batch, max_rows)
+    _, _, buckets = batched.sizes(blocks, max_batch, max_rows, fused=fused)
     config = types.SimpleNamespace(block_size=max(blocks), hidden_size=4, eos_token_ids=(EOS,), vocab_size=1 << 18,
                                    sliding_window=1024)
     model = types.SimpleNamespace(config=config, device="cpu", group=None, slots=max_batch + 1, max_rows=buckets[-1],
                                   vocab=8, max_seq_len=8192)
-    e = batched.BatchedGemmaEngine(model, None, max_batch, blocks=blocks, policy=policy, max_rows=max_rows)
+    e = batched.BatchedGemmaEngine(model, None, max_batch, blocks=blocks, policy=policy, max_rows=max_rows, fused=fused,
+                                   lane_share=lane_share)
     device = Device(e, rng)
 
-    def loop(rows, align):
+    def loop(rows, head, align):
         live = [s for s in e.slots.tolist() if s != e.idle]
-        assert align in e.aligns and rows % align == 0 and rows in e.row_buckets
+        assert align in e.aligns and rows % align == 0 and head % align == 0
         assert all(int(e.length[s]) % align == 0 and int(e.offset[s]) % align == 0 for s in live)
-        return types.SimpleNamespace(replay=lambda stream: device.replay(rows))
+        assert rows in e.row_buckets and head in e.heads
+        return types.SimpleNamespace(replay=lambda stream: device.replay(rows, head))
 
     e._loop = loop
     prompts = [[5] * rng.randint(20, 600) for _ in range(count)]
@@ -156,7 +214,8 @@ def trial(seed, blocks, max_batch, max_rows, concurrency, count):
         assert r.token_ids[-1] == EOS or len(r.token_ids) == budget
         assert all(b in e.blocks for b in r.blocks) and r.first_forwards >= 1
         assert r.canvas_forwards == sorted(r.canvas_forwards) and r.canvas_forwards[0] >= r.admitted_forward
-    return [(t["n"], t["bucket"], t["mix"]) for t in e.trace], [(r.token_ids, r.blocks, r.canvas_forwards) for r in results]
+    return [(t["n"], t["bucket"], t["head"], t["lanes"], t["mix"]) for t in e.trace], \
+        [(r.token_ids, r.blocks, r.canvas_forwards) for r in results], device
 
 
 PHASES = [(1, 4), (4, 16), (16, 64), (64, 256), (16, 64), (1, 4)]
@@ -169,21 +228,32 @@ CASES = {
     "one-request": ((256,), 1, 256, 1, 5),
     "small-switching": ((256, 32), 8, 512, [(1, 3), (8, 40), (1, 3)], 46),
 }
+OPTIONS = {"plain": {}, "fused": {"fused": True}, "fused-fixed-share": {"fused": True, "lane_share": 0.1}}
 
 
 @pytest.mark.parametrize("case", list(CASES))
-def test_host_loop(host, case):
-    launches, results = trial(0, *CASES[case])
-    assert trial(0, *CASES[case]) == (launches, results), "not reproducible"
+@pytest.mark.parametrize("option", list(OPTIONS))
+def test_host_loop(host, case, option):
+    blocks, max_batch, max_rows, concurrency, count = CASES[case]
+    options = OPTIONS[option]
+    launches, results, device = trial(0, blocks, max_batch, max_rows, concurrency, count, **options)
+    assert trial(0, blocks, max_batch, max_rows, concurrency, count, **options)[:2] == (launches, results), \
+        "not reproducible"
+    if options.get("fused") and max_batch >= 8 and min(blocks) <= 64 and case != "small-switching":
+        assert device.lane_commits > 0
 
 
 def test_row_buckets():
-    """One canvas length: N x B per batch bucket; several: FlashInfer's MoE token buckets."""
+    """One canvas length: N x B per batch bucket; several, or lanes: FlashInfer's MoE token buckets, lane rungs."""
     assert batched.row_buckets((32,), 64) == [32, 64, 128, 256, 512, 1024, 2048]
     assert batched.row_buckets((256, 128, 32), 128, 4096) == [32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048,
                                                               2560, 3072, 3584, 4096]
-    assert batched.sizes((256, 128, 32), 128) == (4096, batched.row_buckets((256, 128, 32), 128, 4096))
-    assert batched.sizes((256,), 1)[0] == 256
+    max_rows, size, buckets = batched.sizes((256, 128, 32), 128, fused=True)
+    # 52 lanes of 32 rows on top of 4096 request rows: the first lane rung that holds them.
+    assert (max_rows, size) == (4096, 32) and buckets[-1] == 6144 and all(b % 32 == 0 for b in buckets)
+    assert batched.sizes((256, 128), 128, fused=True)[1] == 0  # no canvas length <= 64: no lanes
+    assert batched.sizes((32,), 4, fused=True)[1] == 0  # fewer than lane_min requests
+    assert np.all(np.diff(buckets) > 0)
 
 
 def test_load_policy():
