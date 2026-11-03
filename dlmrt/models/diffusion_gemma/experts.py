@@ -30,30 +30,36 @@ class DeepGemmExperts:
         self.expected_m = max(1, rows * k // c.num_experts)
 
     def __call__(self, x, logits, layer, out):
-        lo = self.lo
-        moe.route(logits, layer["expert_scale"], self.ids, self.weights, self.slots, self.counts,
-                 self.config.top_k_experts)
+        lo, n = self.lo, logits.shape[0]
+        ids, slots, weights = self.ids[:n], self.slots[:n], self.weights[:n]
+        moe.route(logits, layer["expert_scale"], ids, weights, slots, self.counts, self.config.top_k_experts)
         counts = self.counts[lo:lo + self.count]
-        moe.moe_gather(x, self.ids, self.slots, self.moe_in, lo)
+        moe.moe_gather(x, ids, slots, self.moe_in, lo)
         deep_gemm.m_grouped_bf16_gemm_nt_masked(self.moe_in, layer["w13"], self.moe_mid, counts, self.expected_m)
-        moe.moe_geglu(self.moe_mid, self.ids, self.slots, self.moe_act, lo)
+        moe.moe_geglu(self.moe_mid, ids, slots, self.moe_act, lo)
         deep_gemm.m_grouped_bf16_gemm_nt_masked(self.moe_act, layer["w2"], self.moe_out, counts, self.expected_m)
-        moe.moe_combine(self.moe_out, self.ids, self.slots, self.weights, out, lo)
+        moe.moe_combine(self.moe_out, ids, slots, weights, out, lo)
         return out
 
 
 class TrtllmExperts:
-    def __init__(self, config, lo, rows, device, sample):
+    def __init__(self, config, lo, rows, device, sample, extra_rows=()):
         """`sample`: one layer's `experts.fp4` weights, to pick the kernel tactic for `rows` rows before any graph is
-        captured (every layer has the same shapes)."""
+        captured (every layer has the same shapes). `extra_rows`: further row counts (batched forwards) to tune
+        and size the buffers for."""
         c = self.config = config
         self.lo = lo
-        self.packed = torch.zeros(rows, c.top_k_experts, dtype=torch.int32, device=device)
+        most = max([rows, *extra_rows])
+        self.packed = torch.zeros(most, c.top_k_experts, dtype=torch.int32, device=device)
         # The expert input as the post-attention kernel writes it: NVFP4 codes and E4M3 scales (see `quantized`).
-        self.codes = torch.zeros(rows, c.hidden_size // 2, dtype=torch.uint8, device=device)
-        self.scales = torch.zeros(rows, c.hidden_size // 16, dtype=torch.uint8, device=device)
+        self.codes = torch.zeros(most, c.hidden_size // 2, dtype=torch.uint8, device=device)
+        self.scales = torch.zeros(most, c.hidden_size // 16, dtype=torch.uint8, device=device)
         self.tactics = nvfp4.tune(sample, c.num_experts, lo, c.moe_intermediate_size, rows, c.hidden_size,
                                   c.top_k_experts, device)
+        # Largest first: where the loaded configs lack a row count, its own file has it (see nvfp4.keep).
+        self.extra = [nvfp4.tune(sample, c.num_experts, lo, c.moe_intermediate_size, extra, c.hidden_size,
+                                 c.top_k_experts, device) for extra in sorted(set(extra_rows) - {rows})][::-1]
+        nvfp4.keep(self.extra + [self.tactics])
 
     def quantized(self, layer):
         """(global scale, codes, scales): where kernels.post_attn writes this layer's quantized expert input,
@@ -97,13 +103,15 @@ class TrtllmExperts:
             timed.append((a.elapsed_time(b), tactic))
             del graph
         nvfp4.pin(t, min(timed)[1])
+        nvfp4.keep(self.extra + [self.tactics])
 
     def __call__(self, x, logits, layer, out):
         """`x` None: the input is already in `codes` / `scales` (see `quantized`)."""
-        c = self.config
-        moe.route_packed(logits, layer["expert_scale"], self.packed, c.top_k_experts)
-        return nvfp4.trtllm_moe(x, self.packed, layer["fp4"], out, c.num_experts, self.lo, c.moe_intermediate_size,
-                                quantized=None if x is not None else (self.codes, self.scales))
+        c, n = self.config, logits.shape[0]
+        packed = self.packed[:n]
+        moe.route_packed(logits, layer["expert_scale"], packed, c.top_k_experts)
+        return nvfp4.trtllm_moe(x, packed, layer["fp4"], out, c.num_experts, self.lo, c.moe_intermediate_size,
+                                quantized=None if x is not None else (self.codes[:n], self.scales[:n]))
 
 
 class CutlassExperts:

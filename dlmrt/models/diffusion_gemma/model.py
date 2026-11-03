@@ -1,4 +1,5 @@
-"""DiffusionGemma (26B-A4B): weights, KV cache and the 256-row forward.
+"""DiffusionGemma (26B-A4B): weights, KV cache and the forward of one canvas (or, for batched.py, of several requests'
+rows, each over its own KV arena).
 
 Per layer: sandwich RMSNorms, attention on sliding (window 1024, head_dim 256) or full (head_dim 512, value =
 unweighted norm of the key projection) layers, a dense GeGLU MLP in parallel with 128 top-8 GeGLU experts,
@@ -31,13 +32,17 @@ def _rope_table(inv_freq, max_seq_len):
 
 
 class GemmaModel:
-    def __init__(self, config, weights, max_seq_len, group=None, precision="bf16"):
+    def __init__(self, config, weights, max_seq_len, group=None, precision="bf16", *, slots=1, max_rows=None,
+                 row_buckets=()):
         """`group`: a `parallel.Group` to shard over, or None for one GPU. Attention heads, dense-MLP columns and
         the vocabulary are split Megatron-style, experts are split whole (expert parallelism); the full layers'
         two KV heads are replicated when there are more ranks than KV heads.
 
         `weights` as read by `precision.read_weights`; `precision` "nvfp4" keeps the KV cache in FP8 E4M3 values and
-        runs the experts as W4A4 (precision.py)."""
+        runs the experts as W4A4 (precision.py).
+
+        Batched requests: `slots` KV arenas (one per concurrent request), forwards of up to `max_rows` rows (default
+        one canvas), and the expert kernels' tactics also tuned for the row counts in `row_buckets`."""
         self.config = c = config
         self.max_seq_len = max_seq_len
         self.group = group
@@ -156,7 +161,7 @@ class GemmaModel:
         # it saves, and FA3 reads BF16.
         self.k, self.v = [], []
         for layer in self.layers:
-            shape = (1, max_seq_len, layer["kv_heads"], layer["head_dim"])
+            shape = (slots, max_seq_len, layer["kv_heads"], layer["head_dim"])
             self.k.append(torch.zeros(shape, device=self.device, dtype=self.dtype))
             self.v.append(torch.zeros(shape, device=self.device, dtype=self.dtype))
         d, dg = c.head_dim, c.global_head_dim
@@ -166,13 +171,16 @@ class GemmaModel:
         inv_full[:rotated] = 1.0 / c.rope_theta_full ** (torch.arange(0, 2 * rotated, 2, device=self.device).float() / dg)
         self.rope = {True: _rope_table(inv, max_seq_len), False: _rope_table(inv_full, max_seq_len)}
         rows = c.block_size
+        self.slots, self.max_rows = slots, max_rows or rows
+        if group is not None and self.max_rows != rows:
+            raise ValueError("Batched forwards are implemented at TP=1")
         fp4 = next((layer["fp4"] for layer in self.layers if layer["fp4"] is not None), None)
         if fp4 is None:
-            self.experts = DeepGemmExperts(c, self.expert_lo, self.local_experts, rows, self.device)
+            self.experts = DeepGemmExperts(c, self.expert_lo, self.local_experts, self.max_rows, self.device)
         elif fp4.get("backend") == "cutlass":
-            self.experts = CutlassExperts(c, rows, self.device, fp4)
+            self.experts = CutlassExperts(c, self.max_rows, self.device, fp4)
         else:
-            self.experts = TrtllmExperts(c, self.expert_lo, rows, self.device, fp4)
+            self.experts = TrtllmExperts(c, self.expert_lo, rows, self.device, fp4, extra_rows=row_buckets)
         # Row-parallel outputs (partial sums under TP, in symmetric memory): attention, [dense MLP; experts], SC.
         if group:
             self.attn_out = group.symmetric("dg.attn", (rows, c.hidden_size))
@@ -180,7 +188,7 @@ class GemmaModel:
             self.sc_out = group.symmetric("dg.sc", (rows, c.hidden_size))
         else:
             self.attn_out = self.sc_out = None
-            self.ffn_out = torch.empty(2 * rows, c.hidden_size, dtype=self.dtype, device=self.device)
+            self.ffn_out = torch.empty(2 * self.max_rows, c.hidden_size, dtype=self.dtype, device=self.device)
         # The dense MLP runs on a side stream, concurrently with the expert path (disjoint outputs and scratch).
         self.side = torch.cuda.Stream(self.device) if OVERLAP else None
         block_graph()
@@ -188,7 +196,7 @@ class GemmaModel:
             self.experts.calibrate(self)
 
     @classmethod
-    def load(cls, path, max_seq_len=16384, *, device=None, group=None, precision=None, canvas_length=None):
+    def load(cls, path, max_seq_len=16384, *, device=None, group=None, precision=None, canvas_length=None, **batched):
         """`precision`: "bf16" or "nvfp4" (an NVFP4 checkpoint), default the checkpoint's own (see precision.py).
         Under TP each rank reads only its experts. `canvas_length`: see GemmaConfig.load."""
         config = GemmaConfig.load(path, canvas_length)
@@ -196,7 +204,7 @@ class GemmaModel:
         precision = precision_switch.resolve(path, precision, device, backends=("trtllm", "cutlass"))
         weights = precisions.read_weights(path, config, precision, device, group)
         with torch.cuda.device(device):
-            return cls(config, weights, max_seq_len, group=group, precision=precision)
+            return cls(config, weights, max_seq_len, group=group, precision=precision, **batched)
 
     def reduce(self, partial, site, chain=0):
         """Sum over ranks. Sites on one chain run in order on one stream; a reduction re-arms the previous
@@ -212,30 +220,38 @@ class GemmaModel:
         """This rank's experts' part of the MoE output, written into `out`."""
         return self.experts(x, layer["router"](router_in), layer, out)
 
-    def self_condition(self, probs):
+    def self_condition(self, probs, out=None):
         """SC delta from the previous round's probabilities over this rank's vocabulary rows: GeGLU adapter
         (replicated) on norm(probs @ E * sqrt(H))."""
         c = self.config
         signal = self.reduce(torch.mm(probs, self.lm_head, out=self.sc_out), "sc")
         x = gk.norm(signal, self.sc["norm"], c.rms_norm_eps, pre=self.embed_scale)
-        return self.mlp(x, self.sc)
+        return self.mlp(x, self.sc, out=out)
 
-    def forward(self, h, start, end, leftpad, *, causal, splits):
-        """h: [rows, hidden] block input, consumed in place. Returns the final-norm hidden states.
+    def forward(self, h, start, end, leftpad, *, causal, splits, slots=None, index=None, block=0, modes=None,
+                state=None, out=None):
+        """h: [rows, hidden] block input, consumed in place. Returns the final-norm hidden states (in `out` if
+        given).
 
         Writes this block's K/V at [start, start + rows); `leftpad` bounds the canvas's sliding-layer keys.
+        `slots` / `index` (per row): row r of the request in KV slot slots[r], at position start[slot] + index[r];
+        each request's rows are contiguous and `block`-aligned. `modes` (per slot, with `slots`): causal rows for a
+        request in commit / prefill, canvas rows otherwise. `state` (with `slots`, int32 [rows, 4]): each row's slot's
+        (start, end, leftpad, mode), as kernels.embed gathers it, read by RoPE and attention instead of the slot's.
         """
         c = self.config
         rows = h.shape[0]
         sliding = next(layer for layer in self.layers if layer["sliding"])
         schedule = self.attention.schedule(rows, end, sliding["heads"], sliding["kv_heads"], splits, causal)
-        x = gk.norm(h, self.layers[0]["norm"], c.rms_norm_eps)
+        x = gk.norm(h, self.layers[0]["norm"], c.rms_norm_eps, out=out)
         scratch = (torch.empty_like(h), torch.empty_like(h), torch.empty_like(h))
         for i in range(len(self.layers)):
-            self.layer(i, h, x, scratch, start, end, leftpad, causal=causal, splits=splits, schedule=schedule)
+            self.layer(i, h, x, scratch, start, end, leftpad, causal=causal, splits=splits, schedule=schedule,
+                       slots=slots, index=index, block=block, modes=modes, state=state)
         return x
 
-    def layer(self, i, h, x, scratch, start, end, leftpad, *, causal, splits, schedule):
+    def layer(self, i, h, x, scratch, start, end, leftpad, *, causal, splits, schedule, slots=None, index=None,
+              block=0, modes=None, state=None):
         """Layer i in place: h is the residual stream, x its input norm on entry and the next layer's on exit.
 
         `scratch` is three [rows, hidden] buffers (dense-MLP input, expert input, router input); `schedule` is the
@@ -249,8 +265,10 @@ class GemmaModel:
         cos, sin = self.rope[layer["sliding"]]
         q = torch.empty((1, rows, hq, d), device=h.device, dtype=h.dtype)
         gk.qkv_rope(layer["qkv"](x), layer["q_norm"], layer["k_norm"], cos, sin, start, q, self.k[i], self.v[i],
-                    hq, hk, d, layer["sliding"], eps, kv_fp8=self.kv_fp8, split=self.blackwell)
-        a = self.attention(layer["sliding"], q, self.k[i], self.v[i], start, end, leftpad, causal, splits, schedule)
+                    hq, hk, d, layer["sliding"], eps, kv_fp8=self.kv_fp8, split=self.blackwell, slots=slots, index=index,
+                    state=state)
+        a = self.attention(layer["sliding"], q, self.k[i], self.v[i], start, end, leftpad, causal, splits, schedule,
+                           slots=slots, index=index, block=block, modes=modes, state=state)
         attn = self.reduce(layer["o"](a.view(rows, -1), out=self.attn_out), f"{i}.attn")
         fp4 = self.experts.quantized(layer) if FUSED_QUANT and hasattr(self.experts, "quantized") else None
         gk.post_attn(h, attn, layer["post_attn"], layer["pre_mlp"], layer["pre_moe"], layer["router_scale"],
@@ -265,11 +283,13 @@ class GemmaModel:
             self.side.wait_stream(main)
             with torch.cuda.stream(self.side):
                 y_mlp = self.reduce(self.mlp(x_mlp, layer, out=self.ffn_out[:rows]), f"{i}.mlp", chain=2)
-            y_moe = self.reduce(self.moe(x_moe, router_in, layer, out=self.ffn_out[rows:]), f"{i}.moe", chain=1)
+            y_moe = self.reduce(self.moe(x_moe, router_in, layer, out=self.ffn_out[rows:2 * rows]), f"{i}.moe",
+                                chain=1)
             main.wait_stream(self.side)
         else:
             y_mlp = self.reduce(self.mlp(x_mlp, layer, out=self.ffn_out[:rows]), f"{i}.mlp", chain=2)
-            y_moe = self.reduce(self.moe(x_moe, router_in, layer, out=self.ffn_out[rows:]), f"{i}.moe", chain=1)
+            y_moe = self.reduce(self.moe(x_moe, router_in, layer, out=self.ffn_out[rows:2 * rows]), f"{i}.moe",
+                                chain=1)
         w_next = self.layers[i + 1]["norm"] if i + 1 < len(self.layers) else self.final_norm
         gk.post_ffn(h, y_mlp, y_moe, layer["post_mlp"], layer["post_moe"], layer["post_ffn"], w_next, x,
                     layer["scalar"], eps)

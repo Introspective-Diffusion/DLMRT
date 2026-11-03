@@ -128,6 +128,88 @@ public:
     void replay(uintptr_t stream) { check(cudaGraphLaunch(exec_, reinterpret_cast<cudaStream_t>(stream))); }
 };
 
+__global__ void set_if(cudaGraphConditionalHandle handle, const int* flag) {
+    cudaGraphSetConditional(handle, *flag > 0);
+}
+
+// head -> WHILE(run && step < limit){part_0 -> part_1 -> ...}: a part with a flag pointer runs only while *flag > 0
+// (an IF node evaluated when the part is reached).
+class StagedLoopGraph {
+    cudaGraph_t graph_ = nullptr;
+    cudaGraphExec_t exec_ = nullptr;
+
+public:
+    StagedLoopGraph(uintptr_t head, std::vector<std::tuple<uintptr_t, uintptr_t>> parts, uintptr_t run_ptr,
+                    uintptr_t step_ptr, int limit) {
+        try {
+            check(cudaGraphCreate(&graph_, 0));
+            cudaGraphNode_t first, entry, loop;
+            check(cudaGraphAddChildGraphNode(&first, graph_, nullptr, 0, reinterpret_cast<cudaGraph_t>(head)));
+            cudaGraphConditionalHandle handle;
+            check(cudaGraphConditionalHandleCreate(&handle, graph_, 0, 0));
+            auto run = reinterpret_cast<int*>(run_ptr);
+            auto step = reinterpret_cast<int*>(step_ptr);
+            void* args[] = {&handle, &run, &step, &limit};
+            cudaKernelNodeParams params{};
+            params.func = reinterpret_cast<void*>(set_condition);
+            params.gridDim = dim3(1);
+            params.blockDim = dim3(1);
+            params.kernelParams = args;
+            check(cudaGraphAddKernelNode(&entry, graph_, &first, 1, &params));
+            cudaGraphNodeParams conditional{};
+            conditional.type = cudaGraphNodeTypeConditional;
+            conditional.conditional.handle = handle;
+            conditional.conditional.type = cudaGraphCondTypeWhile;
+            conditional.conditional.size = 1;
+            check(add_node(&loop, graph_, &entry, 1, &conditional));
+            cudaGraph_t body = conditional.conditional.phGraph_out[0];
+            cudaGraphNode_t last = nullptr;
+            for (auto& [part, flag_ptr] : parts) {
+                cudaGraphNode_t node;
+                size_t deps = last ? 1 : 0;
+                if (!flag_ptr) {
+                    check(cudaGraphAddChildGraphNode(&node, body, last ? &last : nullptr, deps,
+                                                     reinterpret_cast<cudaGraph_t>(part)));
+                } else {
+                    cudaGraphConditionalHandle when;
+                    check(cudaGraphConditionalHandleCreate(&when, body, 0, 0));
+                    auto flag = reinterpret_cast<int*>(flag_ptr);
+                    void* if_args[] = {&when, &flag};
+                    cudaKernelNodeParams set{};
+                    set.func = reinterpret_cast<void*>(set_if);
+                    set.gridDim = dim3(1);
+                    set.blockDim = dim3(1);
+                    set.kernelParams = if_args;
+                    cudaGraphNode_t setter;
+                    check(cudaGraphAddKernelNode(&setter, body, last ? &last : nullptr, deps, &set));
+                    cudaGraphNodeParams branch{};
+                    branch.type = cudaGraphNodeTypeConditional;
+                    branch.conditional.handle = when;
+                    branch.conditional.type = cudaGraphCondTypeIf;
+                    branch.conditional.size = 1;
+                    check(add_node(&node, body, &setter, 1, &branch));
+                    cudaGraphNode_t inner;
+                    check(cudaGraphAddChildGraphNode(&inner, branch.conditional.phGraph_out[0], nullptr, 0,
+                                                     reinterpret_cast<cudaGraph_t>(part)));
+                }
+                last = node;
+            }
+            cudaGraphNode_t tail;
+            check(cudaGraphAddKernelNode(&tail, body, last ? &last : nullptr, last ? 1 : 0, &params));
+            check(cudaGraphInstantiate(&exec_, graph_, 0));
+        } catch (...) {
+            if (exec_) cudaGraphExecDestroy(exec_);
+            if (graph_) cudaGraphDestroy(graph_);
+            throw;
+        }
+    }
+    ~StagedLoopGraph() {
+        if (exec_) cudaGraphExecDestroy(exec_);
+        if (graph_) cudaGraphDestroy(graph_);
+    }
+    void replay(uintptr_t stream) { check(cudaGraphLaunch(exec_, reinterpret_cast<cudaStream_t>(stream))); }
+};
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<BlockGraph>(m, "BlockGraph")
         .def(pybind11::init<uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, int>())
@@ -135,4 +217,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<LoopGraph>(m, "LoopGraph")
         .def(pybind11::init<uintptr_t, std::vector<std::tuple<uintptr_t, uintptr_t, uintptr_t, int>>, uintptr_t>())
         .def("replay", &LoopGraph::replay);
+    pybind11::class_<StagedLoopGraph>(m, "StagedLoopGraph")
+        .def(pybind11::init<uintptr_t, std::vector<std::tuple<uintptr_t, uintptr_t>>, uintptr_t, uintptr_t, int>())
+        .def("replay", &StagedLoopGraph::replay);
 }

@@ -60,6 +60,7 @@ ignore = [
     "E741",   # Triton kernels name their output pointer O, as in the papers they follow
     "B023",   # graph-capture lambdas bind their loop variable on purpose (captured immediately)
     "B905",   # zip(strict=...) adds nothing where the lengths match by construction
+    "SIM102", # Triton kernels nest a runtime test inside a constexpr one, which prunes the branch at compile time
     "SIM105", # try / except / pass is as clear as contextlib.suppress
     "SIM108", # ternaries are not always clearer
     "SIM115", # tests hold reference files open for their whole module

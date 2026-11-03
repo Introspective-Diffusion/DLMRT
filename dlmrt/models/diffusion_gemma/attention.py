@@ -52,14 +52,27 @@ class Attention:
                                       qkv_dtype=self.dtype, causal=True, window_size=(c.sliding_window - 1, 0),
                                       num_splits=splits)
 
-    def __call__(self, sliding, q, k, v, start, end, leftpad, causal, splits, schedule):
+    def __call__(self, sliding, q, k, v, start, end, leftpad, causal, splits, schedule, slots=None, index=None,
+                 block=0, modes=None, state=None):
+        """`slots` / `index` (per row): row r at position start[slots[r]] + index[r] of the arena k/v[slots[r]], each
+        request's rows `block`-aligned (Triton only). `modes` (with `slots`): per slot, causal rows for commit /
+        prefill, canvas rows otherwise (`causal` unused). `state`: the rows' slot state (see kernels.embed)."""
+        if slots is not None and self.fa3:
+            raise ValueError("batched requests need the Triton attention (DLMRT_DG_ATTENTION=triton on Hopper)")
         tiles = dict(self.tiles(sliding, k.shape[2]))
-        query_rows = q.shape[1] * q.shape[2] // k.shape[2]
+        if slots is not None:
+            tiles.update(slots=slots, index=index, block=block, state=state)
+        query_rows = (block if slots is not None else q.shape[1]) * q.shape[2] // k.shape[2]
         if "block_m" in tiles and query_rows % tiles["block_m"]:
             # Short canvases: halve the query tile until it divides the rows (Triton's dot needs >= 16).
             while tiles["block_m"] > 16 and query_rows % tiles["block_m"]:
                 tiles["block_m"] //= 2
             tiles["num_warps"] = min(tiles.get("num_warps", 4), 4)
+        if modes is not None:
+            if not sliding:
+                return attention(q, k, v, start, end, False, modes=modes, **tiles)
+            return attention(q, k, v, start, end, False, window=self.config.sliding_window, left=leftpad,
+                             modes=modes, **tiles)
         if not sliding:
             return attention(q, k, v, start, end, causal, **tiles)
         w = self.config.sliding_window - 1
